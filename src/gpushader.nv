@@ -1,0 +1,409 @@
+// gpushader.nv — the shader is text the caller supplies, and the
+// layout is a value.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SHADER IS WGSL AND THIS PACKAGE DOES NOT PARSE IT.  A caller
+// supplies the source; the driver compiles it and answers a diagnostic
+// this package passes through whole.  Writing a WGSL front end here
+// would be a second implementation of a language the backend already
+// has, it would disagree with the backend's in the corners, and the
+// disagreement would show up as a shader that this package accepts and
+// the driver refuses.
+//
+// WHAT THIS PACKAGE DOES INSTEAD IS THE BINDING LAYOUT, because that is
+// where the mismatches actually happen.  A pipeline declares a bind
+// group layout and a shader declares `@group(0) @binding(1)`, and
+// nothing checks that the two agree until a draw produces the wrong
+// pixels — or nothing at all, silently, because an unbound texture
+// reads as transparent black.  `GpuBindingDesc` is the layout as a
+// value, `bindings_of_wgsl` extracts what the SOURCE declares, and
+// `layouts_agree` is the comparison, so the mismatch is a named fault
+// before a device exists.
+//
+// AN ENTRY POINT IS A NAME AND THE NAME IS CHECKED.  A pipeline names
+// its vertex and fragment entry points as strings, and a typo produces
+// a driver error about a missing function on some backends and a
+// silently unbound stage on others.  `has_entry_point` is the scan.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// A shader module's source, and what to call it.
+pub struct GpuShaderDesc
+    label: Str
+    // WGSL, as the caller wrote it.  Not parsed here.
+    wgsl: Str
+
+// Which shader stages a binding is visible to.
+//
+// A set rather than a single stage, because a uniform buffer read by
+// both the vertex and the fragment stage is the ordinary case and a
+// layout that named one stage would need two entries for one binding.
+pub struct GpuStages
+    vertex: Bool
+    fragment: Bool
+    compute: Bool
+
+// What kind of thing a binding is.
+pub enum GpuBindingKind
+    // A read-only buffer of parameters, small and fast.
+    GpuUniformBuffer(min_bytes: Int)
+    // A buffer a shader reads.
+    GpuReadStorageBuffer(min_bytes: Int)
+    // A buffer a shader reads and writes.  Distinct from the
+    // read-only kind because the layouts differ and because a
+    // read-write binding in a render pass is a hazard a backend
+    // refuses.
+    GpuReadWriteStorageBuffer(min_bytes: Int)
+    GpuSampledTexture
+    GpuSampler
+    // A texture a compute shader writes.
+    GpuStorageTexture(format: GpuTextureFormat)
+
+// One binding in a layout.
+pub struct GpuBindingDesc
+    binding: Int
+    kind: GpuBindingKind
+    stages: GpuStages
+
+// One bind group's shape.
+pub struct GpuLayoutDesc
+    label: Str
+    group: Int
+    bindings: [GpuBindingDesc]
+
+// What a resource is bound to a slot with.
+pub enum GpuBindingValue
+    GpuBindBuffer(buffer: GpuBufferId, offset_bytes: Int, size_bytes: Int)
+    GpuBindTextureView(view: GpuViewId)
+    GpuBindSampler(sampler: GpuSamplerId)
+
+// One bind group: a layout, filled in.
+pub struct GpuBindGroupDesc
+    label: Str
+    layout: GpuLayoutId
+    bindings: [GpuBindingSlot]
+
+// One filled slot.
+pub struct GpuBindingSlot
+    binding: Int
+    value: GpuBindingValue
+
+// One vertex attribute.
+pub struct GpuVertexAttribute
+    // The `@location(n)` the shader declares.
+    location: Int
+    // Byte offset within the vertex.
+    offset_bytes: Int
+    // How many 32-bit floats: 2 for a position or a UV, 3 for a 3D
+    // position, 4 for a colour.  Floats only, because that is what a 2D
+    // renderer and a mesh both use and an integer attribute is a row
+    // for later rather than a field nobody sets.
+    floats: Int
+
+// One vertex buffer's layout.
+pub struct GpuVertexBufferDesc
+    // Bytes from one vertex to the next.  The number that is wrong by
+    // four in every renderer that has ever added an attribute and
+    // forgotten it, and whose symptom is geometry that shears.
+    stride_bytes: Int
+    // One entry per vertex, or one per instance.
+    per_instance: Bool
+    attributes: [GpuVertexAttribute]
+
+// A render pipeline's description.
+pub struct GpuRenderPipelineDesc
+    label: Str
+    shader: GpuShaderId
+    vertex_entry: Str
+    fragment_entry: Str
+    target_format: GpuTextureFormat
+    vertex_buffers: [GpuVertexBufferDesc]
+    layouts: [GpuLayoutId]
+    // Straight alpha blending.  A flag rather than a blend-state struct
+    // because there are two answers a 2D renderer ever wants and a full
+    // blend state is a row for later.
+    alpha_blend: Bool
+
+// A compute pipeline's description.
+//
+// No layouts: a compute pipeline derives its bind group layout from the
+// shader, which is what the backend does and what makes a hand-built
+// layout a second source of truth.
+pub struct GpuComputePipelineDesc
+    label: Str
+    shader: GpuShaderId
+    entry: Str
+
+// A shader description.
+//
+// ```novo
+// use gpushader
+//
+// fn source(wgsl: Str) -> GpuShaderDesc
+//     gpushader.shader("atlas", wgsl)
+//
+// fn main() [io]
+//     println("a shader, as text")
+// ```
+pub fn shader(label: Str, wgsl: Str) -> GpuShaderDesc []
+    todo("gpu-nv.gpushader.shader")
+
+// The stages a binding is visible to.
+//
+// ```novo
+// use gpushader
+//
+// fn both() -> GpuStages
+//     gpushader.stages(true, true, false)
+//
+// fn main() [io]
+//     println("visible to the vertex and fragment stages")
+// ```
+pub fn stages(vertex: Bool, fragment: Bool, compute: Bool) -> GpuStages []
+    todo("gpu-nv.gpushader.stages")
+
+// A bind group layout.
+//
+// ```novo
+// use gpushader
+//
+// fn atlas(b: [GpuBindingDesc]) -> GpuLayoutDesc
+//     gpushader.layout("atlas", 0, b)
+//
+// fn main() [io]
+//     println("one bind group's shape")
+// ```
+pub fn layout(label: Str, group: Int, bindings: [GpuBindingDesc]) -> GpuLayoutDesc []
+    todo("gpu-nv.gpushader.layout")
+
+// The sampler-and-texture layout a textured quad needs.
+//
+// Sampler at binding 0, sampled texture at binding 1, fragment stage.
+// Named because it is the layout every 2D renderer starts from and
+// because getting the two the wrong way round produces a draw that
+// silently renders nothing.
+//
+// ```novo
+// use gpushader
+//
+// fn quad() -> GpuLayoutDesc
+//     gpushader.sampler_texture_layout("quad", 0)
+//
+// fn main() [io]
+//     println("the layout a textured quad wants")
+// ```
+pub fn sampler_texture_layout(label: Str, group: Int) -> GpuLayoutDesc []
+    todo("gpu-nv.gpushader.sampler_texture_layout")
+
+// What a WGSL source declares it will be bound.
+//
+// A scan for `@group(n) @binding(m) var<...>` and the type after it —
+// not a parse of the language, and it says so: a source this cannot
+// read answers an empty list rather than a wrong one, and
+// `layouts_agree` treats an empty list as "unknown" rather than as
+// "nothing".
+//
+// ```novo
+// use gpushader
+//
+// fn declared(wgsl: Str) -> [GpuBindingDesc]
+//     gpushader.bindings_of_wgsl(wgsl)
+//
+// fn main() [io]
+//     println("what a shader says it needs")
+// ```
+pub fn bindings_of_wgsl(wgsl: Str) -> [GpuBindingDesc] []
+    todo("gpu-nv.gpushader.bindings_of_wgsl")
+
+// Do a layout and what a shader declares agree?
+//
+// THE CHECK THIS MODULE EXISTS FOR.  Nothing else compares the two
+// until a draw produces the wrong pixels — or none at all, silently,
+// because an unbound texture reads as transparent black and looks
+// exactly like a correct draw of nothing.
+//
+// Answers every disagreement rather than the first, and an empty answer
+// for a source the scan could not read, because "I could not tell" and
+// "they agree" must not be the same answer.
+//
+// ```novo
+// use gpushader
+//
+// fn ok(l: GpuLayoutDesc, wgsl: Str) -> Bool
+//     list.len(gpushader.layouts_agree(l, wgsl)) == 0
+//
+// fn main() [io]
+//     println("whether a layout matches its shader")
+// ```
+pub fn layouts_agree(l: GpuLayoutDesc, wgsl: Str) -> [Str] []
+    todo("gpu-nv.gpushader.layouts_agree")
+
+// Does this source declare a function with this name?
+//
+// A typo in an entry point produces a driver error about a missing
+// function on some backends and a silently unbound stage on others.
+//
+// ```novo
+// use gpushader
+//
+// fn there(wgsl: Str) -> Bool
+//     gpushader.has_entry_point(wgsl, "vs_main")
+//
+// fn main() [io]
+//     println("whether a shader has the entry point a pipeline names")
+// ```
+pub fn has_entry_point(wgsl: Str, name: Str) -> Bool []
+    todo("gpu-nv.gpushader.has_entry_point")
+
+// The workgroup size a compute entry point declares.
+//
+// `@workgroup_size(x, y, z)`, which a dispatch has to divide by and
+// which is written in the shader rather than passed to the dispatch —
+// so a caller that assumed 64 and a shader that declared 256 runs a
+// quarter of the work.  `None` when the scan could not read it.
+//
+// ```novo
+// use gpushader
+//
+// fn size(wgsl: Str) -> Bool
+//     match gpushader.workgroup_size_of(wgsl, "main")
+//         Some(s) => true
+//         None    => false
+//
+// fn main() [io]
+//     println("the workgroup size a shader declares")
+// ```
+pub fn workgroup_size_of(wgsl: Str, entry: Str) -> ?GpuWorkgroupSize []
+    todo("gpu-nv.gpushader.workgroup_size_of")
+
+// A compute entry point's declared workgroup size.
+pub struct GpuWorkgroupSize
+    x: Int
+    y: Int
+    z: Int
+
+// A vertex layout.
+//
+// ```novo
+// use gpushader
+//
+// fn quad(a: [GpuVertexAttribute]) -> GpuVertexBufferDesc
+//     gpushader.vertex_buffer(16, false, a)
+//
+// fn main() [io]
+//     println("a vertex buffer's layout")
+// ```
+pub fn vertex_buffer(stride_bytes: Int, per_instance: Bool,
+                     attributes: [GpuVertexAttribute]) -> GpuVertexBufferDesc []
+    todo("gpu-nv.gpushader.vertex_buffer")
+
+// One vertex attribute.
+//
+// ```novo
+// use gpushader
+//
+// fn position() -> GpuVertexAttribute
+//     gpushader.attribute(0, 0, 2)
+//
+// fn main() [io]
+//     println("a position at location zero")
+// ```
+pub fn attribute(location: Int, offset_bytes: Int, floats: Int) -> GpuVertexAttribute []
+    todo("gpu-nv.gpushader.attribute")
+
+// Does this vertex layout's stride hold its attributes?
+//
+// The number that is wrong by four in every renderer that has added an
+// attribute and forgotten it, and whose symptom is geometry that shears
+// across the screen rather than an error.
+//
+// ```novo
+// use gpushader
+//
+// fn ok(v: GpuVertexBufferDesc) -> Bool
+//     gpushader.stride_fits(v)
+//
+// fn main() [io]
+//     println("whether a stride holds what it says it holds")
+// ```
+pub fn stride_fits(v: GpuVertexBufferDesc) -> Bool []
+    todo("gpu-nv.gpushader.stride_fits")
+
+// The stride these attributes actually need.
+//
+// What `stride_fits` compares against, published so a caller can set
+// the field from it rather than count by hand.
+//
+// ```novo
+// use gpushader
+//
+// fn main() [io]
+//     println("${gpushader.required_stride([])}")
+// ```
+pub fn required_stride(attributes: [GpuVertexAttribute]) -> Int []
+    todo("gpu-nv.gpushader.required_stride")
+
+// A render pipeline description.
+//
+// ```novo
+// use gpushader
+// use gpures
+//
+// fn quad(s: GpuShaderId) -> GpuRenderPipelineDesc
+//     gpushader.render_pipeline("quad", s, "vs_main", "fs_main", GpuBgra8Unorm)
+//
+// fn main() [io]
+//     println("a pipeline, described")
+// ```
+pub fn render_pipeline(label: Str, shader: GpuShaderId, vertex_entry: Str, fragment_entry: Str,
+                       target_format: GpuTextureFormat) -> GpuRenderPipelineDesc []
+    todo("gpu-nv.gpushader.render_pipeline")
+
+// A compute pipeline description.
+//
+// ```novo
+// use gpushader
+// use gpures
+//
+// fn kernel(s: GpuShaderId) -> GpuComputePipelineDesc
+//     gpushader.compute_pipeline("double", s, "main")
+//
+// fn main() [io]
+//     println("a compute pipeline, described")
+// ```
+pub fn compute_pipeline(label: Str, shader: GpuShaderId, entry: Str) -> GpuComputePipelineDesc []
+    todo("gpu-nv.gpushader.compute_pipeline")
+
+// A bind group description.
+//
+// ```novo
+// use gpushader
+//
+// fn group(l: GpuLayoutId, slots: [GpuBindingSlot]) -> GpuBindGroupDesc
+//     gpushader.bind_group("atlas", l, slots)
+//
+// fn main() [io]
+//     println("a bind group, described")
+// ```
+pub fn bind_group(label: Str, layout: GpuLayoutId,
+                  bindings: [GpuBindingSlot]) -> GpuBindGroupDesc []
+    todo("gpu-nv.gpushader.bind_group")
+
+// Does a bind group fill every slot its layout declares?
+//
+// An unfilled slot is the silent failure: a backend that tolerates it
+// reads the texture as transparent black, so the draw succeeds and
+// draws nothing.  Answers the bindings that are missing.
+//
+// ```novo
+// use gpushader
+//
+// fn complete(d: GpuBindGroupDesc, l: GpuLayoutDesc) -> Bool
+//     list.len(gpushader.missing_bindings(d, l)) == 0
+//
+// fn main() [io]
+//     println("whether every slot is filled")
+// ```
+pub fn missing_bindings(d: GpuBindGroupDesc, l: GpuLayoutDesc) -> [Int] []
+    todo("gpu-nv.gpushader.missing_bindings")

@@ -1,0 +1,80 @@
+[package]
+name        = "gpu-nv"
+license     = "Apache-2.0"
+version     = "0.0.1"
+description = "std.gpu as a package: adapters, devices, buffers, textures, pipelines and bind groups as values, WGSL the caller supplies, a frame recorded as a command list a host submits, and the driver as a trait a shelf binding or the standard library's own runtime implements.  Interface only — every body is a todo()."
+
+# `license` sits immediately after the name, before any value that could
+# contain a square bracket.  The publish reads it with a pattern that
+# stops at the first `[`, so a description naming an effect row hides it
+# and the release records no licence at all — silently.
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, from the plan, and the split inside it is the design.
+#
+# `gpures`, `gpucmd` and `gpushader` are `[]` throughout: a descriptor,
+# a recorded frame and a binding layout are values a caller builds and
+# checks with no device present.  `gpudriver` is the boundary, and its
+# rows are `[io]` and `[io, time]`.
+#
+# THOSE ROWS ARE WHAT `std.gpu` DECLARES, MINUS `[ffi]`.  The standard
+# library's externs read `[io, ffi]`, and `[io, time, ffi]` where the
+# call blocks until the device answers — opening a device, writing a
+# buffer, submitting, reading back.  `[ffi]` is `sys`-only under the
+# layer rules, and that is exactly what the driver trait is for: the C
+# library stays on the shelf behind an impl, and a `sys` impl declaring
+# `[io, time, ffi]` against an `[io, time]` member is legal because a
+# trait with no effect parameter does not pin its impls' rows.
+#
+# The plan row said `[hw]`/`[gpu]`.  `gpu` is not one of SPEC § 5.1's
+# eleven labels, so it cannot be an effect row at all; and `[hw]` is a
+# claim the standard library does not make about these same calls.  The
+# rows here are the ones the runtime already declares, which is the
+# answer that cannot be wrong about what the code does.
+layer       = "host"
+
+category    = "graphics"
+
+tags        = ["gpu", "wgpu", "webgpu", "compute", "render", "wgsl", "graphics"]
+repository  = "https://github.com/novolang/gpu-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A frame is a value, and only the driver performs"
+
+[dependencies]
+# NONE, and the absences are the design.
+#
+# NOT a windowing package.  A surface, a swapchain and a frame are
+# `std.window`'s, and `std.gpu`'s own documentation already draws that
+# line: this package renders to a texture, and presenting one is
+# somebody else's.  An offscreen render is the whole of what a test, a
+# thumbnailer and a headless renderer need, and it is the half that has
+# no platform in it.
+#
+# NOT a C binding.  `libvulkan-sys` and the rest live on the bindings
+# shelf at layer `sys`, and a `host` package may not depend on one —
+# which is the rule that keeps a C toolchain from arriving through a
+# dependency.  `gpudriver.GpuDriver` is how a binding is reached: the
+# program takes both and supplies the impl, and this package never
+# names a C library.
+#
+# NOT the standard library's `gpu` module either, for the same reason
+# in the other direction: its externs declare `[ffi]`, which a `host`
+# package may not, and it is the runtime boundary rather than a
+# dependency.  It stays where it is, and an impl of `GpuDriver` over it
+# is how a program uses both.
+#
+# NOT a linear algebra package.  A transform matrix is sixteen floats a
+# caller writes into a uniform buffer, and a driver has no business
+# choosing which package produced them.

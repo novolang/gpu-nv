@@ -1,0 +1,175 @@
+// resource_tests.nv — the descriptors, and the two numbers that make a
+// readback silently wrong.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: gpu-nv.gpures.<fn>`.  That
+// is the expected result until the bodies land.
+//
+// WHERE THE CONSTANTS CAME FROM.  256 is WebGPU's
+// `COPY_BYTES_PER_ROW_ALIGNMENT` and is the same on Vulkan, Metal and
+// D3D12; 8192 and 4 are `maxTextureDimension2D` and `maxBindGroups` in
+// the WebGPU specification's required limits, which is the floor every
+// backend must meet.  Asserting them is a port check rather than a
+// restatement of this package's code.
+
+use std.test
+use gpures
+
+@test
+fn test_the_usage_sets_are_named_because_the_combinations_are_the_point() [io]
+    test.case("nothing")
+    let none_of_it = gpures.no_usage()
+    test.assert(none_of_it.storage == false)
+    test.assert(none_of_it.map_read == false)
+
+    test.case("a compute working buffer is copy-src, copy-dst and storage")
+    let work = gpures.storage_usage()
+    test.assert(work.storage)
+    test.assert(work.copy_src)
+    test.assert(work.copy_dst)
+
+    test.case("and it is NOT mappable, which is why a readback needs a copy")
+    test.assert(work.map_read == false)
+
+    test.case("a readback buffer is copy-dst and mappable and not storage")
+    let back = gpures.read_usage()
+    test.assert(back.map_read)
+    test.assert(back.copy_dst)
+    test.assert(back.storage == false)
+
+@test
+fn test_storage_and_map_read_together_are_refused_by_every_backend() [io]
+    test.case("the two named sets are legal")
+    test.assert(gpures.usage_is_legal(gpures.storage_usage()))
+    test.assert(gpures.usage_is_legal(gpures.read_usage()))
+
+    test.case("and the combination nobody allows is not")
+    let both = GpuBufferUsage {
+        copy_src: false,
+        copy_dst: false,
+        storage: true,
+        uniform: false,
+        vertex: false,
+        index: false,
+        map_read: true,
+        map_write: false }
+    test.assert(gpures.usage_is_legal(both) == false)
+
+@test
+fn test_a_row_stride_is_padded_to_the_alignment_or_the_image_shears() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  A caller that passed the
+    // unpadded row gets a readback that SUCCEEDS and is sheared, one
+    // row further out of place per row, with no error attached to it.
+    test.case("the alignment every backend requires")
+    test.assert_eq(gpures.baseline_limits().copy_bytes_per_row_alignment, 256)
+
+    test.case("a 64-pixel RGBA row is exactly the alignment, so no padding")
+    test.assert_eq(gpures.row_bytes(GpuRgba8Unorm, 64), 256)
+    test.assert_eq(gpures.padded_row_bytes(GpuRgba8Unorm, 64, 256), 256)
+
+    test.case("a 65-pixel row is 260 bytes and pads to 512")
+    test.assert_eq(gpures.row_bytes(GpuRgba8Unorm, 65), 260)
+    test.assert_eq(gpures.padded_row_bytes(GpuRgba8Unorm, 65, 256), 512)
+
+    test.case("and the width is not the row: a float format is four times wider")
+    test.assert_eq(gpures.format_bytes(GpuRgba8Unorm), 4)
+    test.assert_eq(gpures.format_bytes(GpuRgba32Float), 16)
+    test.assert_eq(gpures.row_bytes(GpuRgba32Float, 64), 1024)
+
+@test
+fn test_a_descriptor_is_checked_against_limits_before_the_allocation() [io]
+    let l = gpures.baseline_limits()
+
+    test.case("the floor every backend must meet")
+    test.assert_eq(l.max_texture_dimension_2d, 8192)
+    test.assert_eq(l.max_bind_groups, 4)
+
+    test.case("a small buffer fits")
+    test.assert_none(gpures.fits_limits(gpures.buffer("scratch", 4096, gpures.storage_usage()), l))
+
+    test.case("a buffer past the limit does not, and says which limit")
+    test.assert_some(gpures.fits_limits(gpures.buffer("huge", 1099511627776,
+                                                      gpures.storage_usage()),
+                                                      l))
+
+    test.case("a texture within the dimension fits")
+    test.assert_none(gpures.texture_fits_limits(gpures.texture_2d("target", 64, 64,
+                                                                 GpuRgba8Unorm),
+                                                                 l))
+
+    test.case("and one past it does not")
+    test.assert_some(gpures.texture_fits_limits(gpures.texture_2d("vast", 16384, 16384,
+                                                                  GpuRgba8Unorm),
+                                                                  l))
+
+@test
+fn test_an_offscreen_texture_is_both_a_target_and_a_source() [io]
+    // The shape a test and a thumbnailer both want, and one a package
+    // with only a "render target" and only a "sampled texture" cannot
+    // express.
+    let t = gpures.texture_2d("offscreen", 64, 64, GpuRgba8Unorm)
+
+    test.case("it can be rendered to")
+    test.assert(t.render_attachment)
+
+    test.case("and sampled from")
+    test.assert(t.texture_binding)
+
+    test.case("and copied out of, for a readback")
+    test.assert(t.copy_src)
+
+@test
+fn test_a_glyph_atlas_wants_nearest_filtering_and_a_clamped_edge() [io]
+    // Linear filtering on a text atlas produces the blurred edges every
+    // terminal emulator has shipped by accident at least once.
+    let s = gpures.sampler_nearest_clamp("atlas")
+    test.assert(s.nearest)
+    test.assert(s.clamp)
+
+@test
+fn test_the_adapter_a_program_picks_is_not_the_first_one() [io]
+    // On a laptop with two adapters the first is the integrated one,
+    // which is why every program writes this rule and half of them
+    // write it wrong.
+    let integrated = GpuAdapterInfo {
+        name: "integrated",
+        vendor: "v",
+        kind: GpuIntegrated,
+        backend: GpuVulkan,
+        driver: "1" }
+    let discrete = GpuAdapterInfo {
+        name: "discrete",
+        vendor: "v",
+        kind: GpuDiscrete,
+        backend: GpuVulkan,
+        driver: "1" }
+    let software = GpuAdapterInfo {
+        name: "llvmpipe",
+        vendor: "mesa",
+        kind: GpuCpu,
+        backend: GpuSoftware,
+        driver: "1" }
+
+    test.case("discrete beats integrated even when integrated is first")
+    match gpures.preferred_adapter([integrated, discrete], false)
+        None    => test.assert(false)
+        Some(a) => test.assert_eq_str(a.name, "discrete")
+
+    test.case("a software rasteriser is recognised")
+    test.assert(gpures.is_software(software))
+    test.assert(gpures.is_software(discrete) == false)
+
+    test.case("and is not picked unless a caller asked for one")
+    test.assert_none(gpures.preferred_adapter([software], false))
+    test.assert_some(gpures.preferred_adapter([software], true))
+
+    test.case("no adapters at all is a real answer on a headless machine")
+    test.assert_none(gpures.preferred_adapter([], true))
+
+@test
+fn test_a_backend_has_a_name_a_bug_report_can_carry() [io]
+    test.case("vulkan")
+    test.assert_eq_str(gpures.backend_name(GpuVulkan), "Vulkan")
+
+    test.case("and the software one says what it is")
+    test.assert_eq_str(gpures.backend_name(GpuSoftware), "software")

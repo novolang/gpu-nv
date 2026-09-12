@@ -1,0 +1,176 @@
+// command_tests.nv — a frame is a value, so a machine with no GPU can
+// check one.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: gpu-nv.<module>.<fn>`.
+//
+// WHAT THIS FILE IS ABOUT, AND WHY IT CAN EXIST AT ALL.  Every
+// assertion here is about a recorded list rather than about a device.
+// That is the point of the design: a frame built with an encoder can
+// only be checked by running it, and a frame built as a value can be
+// checked by a test on a build machine with no graphics hardware in it.
+// The render half of a terminal becomes testable exactly here.
+
+use std.test
+use std.bytes
+use std.list
+use gpures
+use gpucmd
+
+fn a_view() -> GpuViewId
+    GpuViewId { handle: 1 }
+
+fn a_pipeline() -> GpuPipelineId
+    GpuPipelineId { handle: 2 }
+
+fn a_buffer() -> GpuBufferId
+    GpuBufferId { handle: 3 }
+
+@test
+fn test_a_list_is_built_by_folding_and_not_by_mutating() [io]
+    let empty = gpucmd.list("frame")
+
+    test.case("a fresh list holds nothing")
+    test.assert_eq(gpucmd.length(empty), 0)
+
+    test.case("pushing answers a new list")
+    test.assert_eq(gpucmd.length(gpucmd.push(empty, GpuPopLabel)), 1)
+
+    test.case("and the original is unchanged, because it is a value")
+    test.assert_eq(gpucmd.length(empty), 0)
+
+    test.case("a batch goes on in one call")
+    test.assert_eq(gpucmd.length(gpucmd.extend(empty, [GpuPopLabel, GpuPopLabel])), 2)
+
+@test
+fn test_a_pass_helper_cannot_leave_a_pass_open() [io]
+    test.case("a render pass wraps its commands in a begin and an end")
+    let inner = [GpuSetPipeline(pipeline: a_pipeline()),
+                 GpuDraw(vertex_count: 6, instance_count: 1)]
+    test.assert_eq(list.len(gpucmd.render_pass(a_view(), 0.0, 0.0, 0.0, 1.0, inner)), 4)
+
+    test.case("and so does a compute pass")
+    let work = [GpuSetPipeline(pipeline: a_pipeline()), GpuDispatch(x: 1, y: 1, z: 1)]
+    test.assert_eq(list.len(gpucmd.compute_pass(work)), 4)
+
+@test
+fn test_a_list_that_is_not_a_legal_submission_is_a_named_fault() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  Every one of these is a
+    // driver error at run time in an encoder-based API, with a handle
+    // number in the message; here each is a position in a list and a
+    // name.
+    let l = gpures.baseline_limits()
+
+    test.case("a legal frame has no faults")
+    let good = gpucmd.extend(gpucmd.list("frame"),
+                             gpucmd.render_pass(a_view(), 0.0, 0.0, 0.0, 1.0,
+                                                [GpuSetPipeline(pipeline: a_pipeline()),
+                                                 GpuDraw(vertex_count: 6, instance_count: 1)]))
+    test.assert_eq(list.len(gpucmd.validate(good, l)), 0)
+
+    test.case("a draw outside any pass is one")
+    let loose = gpucmd.push(gpucmd.list("frame"),
+                            GpuDraw(vertex_count: 6, instance_count: 1))
+    test.assert(list.len(gpucmd.validate(loose, l)) > 0)
+
+    test.case("a pass left open is one")
+    let open_pass = gpucmd.push(gpucmd.list("frame"),
+                                GpuBeginRenderPass(target: a_view(), r: 0.0, g: 0.0, b: 0.0,
+                                                   a: 1.0))
+    test.assert(list.len(gpucmd.validate(open_pass, l)) > 0)
+
+    test.case("a draw with no pipeline set is one")
+    let unpiped = gpucmd.extend(gpucmd.list("frame"),
+                                gpucmd.render_pass(a_view(), 0.0, 0.0, 0.0, 1.0,
+                                                   [GpuDraw(vertex_count: 6, instance_count: 1)]))
+    test.assert(list.len(gpucmd.validate(unpiped, l)) > 0)
+
+    test.case("a dispatch in a render pass is one")
+    let wrong_kind = gpucmd.extend(gpucmd.list("frame"),
+                                   gpucmd.render_pass(a_view(), 0.0, 0.0, 0.0, 1.0,
+                                                      [GpuSetPipeline(pipeline: a_pipeline()),
+                                                       GpuDispatch(x: 1, y: 1, z: 1)]))
+    test.assert(list.len(gpucmd.validate(wrong_kind, l)) > 0)
+
+    test.case("a dispatch past the adapter's limit is one, checked before anything is sent")
+    let too_big = gpucmd.extend(gpucmd.list("frame"),
+                                gpucmd.compute_pass([GpuSetPipeline(pipeline: a_pipeline()),
+                                                     GpuDispatch(x: 1000000000, y: 1, z: 1)]))
+    test.assert(list.len(gpucmd.validate(too_big, l)) > 0)
+
+    test.case("and an unaligned texture copy is one, rather than a sheared image")
+    let skewed = gpucmd.push(gpucmd.list("frame"),
+                             GpuCopyTextureToBuffer(texture: GpuTextureId { handle: 4 },
+                                                    width: 65, height: 65, dst: a_buffer(),
+                                                    bytes_per_row: 260))
+    test.assert(list.len(gpucmd.validate(skewed, l)) > 0)
+
+@test
+fn test_every_fault_is_answered_and_not_only_the_first() [io]
+    // A frame built by a renderer usually has one kind of mistake
+    // repeated, and fixing them one error at a time is one round trip
+    // per draw call.
+    let l = gpures.baseline_limits()
+    let three_loose = gpucmd.extend(gpucmd.list("frame"),
+                                    [GpuDraw(vertex_count: 3, instance_count: 1),
+                                     GpuDraw(vertex_count: 3, instance_count: 1),
+                                     GpuDraw(vertex_count: 3, instance_count: 1)])
+    test.assert(list.len(gpucmd.validate(three_loose, l)) > 1)
+
+@test
+fn test_a_compute_round_trip_includes_the_copy_everybody_leaves_out() [io]
+    // `storage` and `map_read` are mutually exclusive, so a result a
+    // shader wrote cannot be read by the host without a copy — and a
+    // program that tried gets a driver error about a buffer rather than
+    // about the rule.
+    let l = gpucmd.compute_round_trip(a_pipeline(), GpuBindGroupId { handle: 5 }, a_buffer(),
+                                      GpuBufferId { handle: 6 }, bytes.zeros(256), 4)
+
+    test.case("it is a legal submission on its own")
+    test.assert_eq(list.len(gpucmd.validate(l, gpures.baseline_limits())), 0)
+
+    test.case("it touches both buffers")
+    test.assert(gpucmd.uses_buffer(l, a_buffer()))
+    test.assert(gpucmd.uses_buffer(l, GpuBufferId { handle: 6 }))
+
+    test.case("and not one it was never given")
+    test.assert(gpucmd.uses_buffer(l, GpuBufferId { handle: 99 }) == false)
+
+@test
+fn test_the_last_partial_workgroup_is_not_dropped() [io]
+    // `n / size` leaves the tail of the data untouched, with no error,
+    // on exactly the inputs whose length is not a multiple of the
+    // workgroup size.
+    test.case("an exact multiple")
+    test.assert_eq(gpucmd.workgroups_for(256, 64), 4)
+
+    test.case("and one item more needs another whole group")
+    test.assert_eq(gpucmd.workgroups_for(257, 64), 5)
+
+    test.case("a single item still needs one")
+    test.assert_eq(gpucmd.workgroups_for(1, 64), 1)
+
+    test.case("and nothing needs none")
+    test.assert_eq(gpucmd.workgroups_for(0, 64), 0)
+
+@test
+fn test_a_frame_can_be_counted_so_a_renderer_can_defend_its_batching() [io]
+    // "This frame is one draw" is a property worth defending, and
+    // without a count it can only be checked by looking at a capture.
+    let l = gpucmd.extend(gpucmd.list("frame"),
+                          gpucmd.render_pass(a_view(), 0.0, 0.0, 0.0, 1.0,
+                                             [GpuSetPipeline(pipeline: a_pipeline()),
+                                              GpuDraw(vertex_count: 6, instance_count: 400)]))
+    let w = gpucmd.work_count(l)
+
+    test.case("four hundred glyphs, one draw")
+    test.assert_eq(w.draws, 1)
+
+    test.case("one pass")
+    test.assert_eq(w.passes, 1)
+
+    test.case("no dispatches")
+    test.assert_eq(w.dispatches, 0)
+
+    test.case("and nothing uploaded")
+    test.assert_eq(w.upload_bytes, 0)

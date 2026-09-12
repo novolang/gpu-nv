@@ -1,0 +1,275 @@
+// shader_tests.nv — the layout against the shader, and the driver seam
+// implemented in thirty lines.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: gpu-nv.<module>.<fn>`.
+//
+// THE SECOND HALF OF THIS FILE IMPLEMENTS `GpuDriver`.  That is an
+// assertion in itself: the seam is meant to be small enough that a test
+// double, a shelf binding over a C library and the standard library's
+// own runtime are all plausible implementations, and a trait a test
+// cannot implement in one screen is one a second backend will not
+// implement either.  `NoDriver` answers `GpuNoAdapter` to everything,
+// which is exactly what a build machine with no graphics hardware would
+// answer.
+
+use std.test
+use std.list
+use gpures
+use gpucmd
+use gpushader
+use gpudriver
+
+// A WGSL source with two entry points and one bind group, written out
+// so the scans have something real to read.
+fn a_shader_source() -> Str
+    "@group(0) @binding(0) var s: sampler;\n@group(0) @binding(1) var t: texture_2d<f32>;\n@vertex fn vs_main() {}\n@fragment fn fs_main() {}\n"
+
+fn a_compute_source() -> Str
+    "@compute @workgroup_size(64) fn main() {}\n"
+
+@test
+fn test_a_shader_is_text_this_package_does_not_parse() [io]
+    let s = gpushader.shader("atlas", a_shader_source())
+
+    test.case("the source travels as the caller wrote it")
+    test.assert_eq_str(s.wgsl, a_shader_source())
+
+    test.case("and the label with it, because a capture with four hundred unnamed draws is unreadable")
+    test.assert_eq_str(s.label, "atlas")
+
+@test
+fn test_an_entry_point_typo_is_caught_before_a_driver_sees_it() [io]
+    // A typo produces a driver error about a missing function on some
+    // backends and a silently unbound stage on others.
+    test.case("the two the pipeline names are there")
+    test.assert(gpushader.has_entry_point(a_shader_source(), "vs_main"))
+    test.assert(gpushader.has_entry_point(a_shader_source(), "fs_main"))
+
+    test.case("and one that is not is not")
+    test.assert(gpushader.has_entry_point(a_shader_source(), "vs_mian") == false)
+
+@test
+fn test_a_dispatch_divides_by_the_size_the_shader_declares() [io]
+    // The workgroup size is written in the shader rather than passed to
+    // the dispatch, so a caller that assumed 64 and a shader that
+    // declared 256 runs a quarter of the work.
+    test.case("what the source says")
+    match gpushader.workgroup_size_of(a_compute_source(), "main")
+        None    => test.assert(false)
+        Some(w) =>
+            test.assert_eq(w.x, 64)
+            test.assert_eq(w.y, 1)
+            test.assert_eq(w.z, 1)
+
+    test.case("and an entry point that is not there declares nothing")
+    test.assert_none(gpushader.workgroup_size_of(a_compute_source(), "other"))
+
+@test
+fn test_a_layout_that_disagrees_with_its_shader_is_a_named_fault() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  Nothing else compares the
+    // two until a draw produces the wrong pixels — or none at all,
+    // because an unbound texture reads as transparent black and looks
+    // exactly like a correct draw of nothing.
+    let good = gpushader.sampler_texture_layout("quad", 0)
+
+    test.case("the sampler-and-texture layout matches the source that declares it")
+    test.assert_eq(list.len(gpushader.layouts_agree(good, a_shader_source())), 0)
+
+    test.case("what the source declares is read back")
+    test.assert_eq(list.len(gpushader.bindings_of_wgsl(a_shader_source())), 2)
+
+    test.case("a layout with a binding the shader does not declare disagrees")
+    let extra = gpushader.layout("quad", 0,
+                                 [GpuBindingDesc { binding: 0,
+                                                   kind: GpuSampler,
+                                                   stages: gpushader.stages(false, true, false) },
+                                  GpuBindingDesc { binding: 1,
+                                                   kind: GpuSampledTexture,
+                                                   stages: gpushader.stages(false, true, false) },
+                                  GpuBindingDesc { binding: 2,
+                                                   kind: GpuUniformBuffer(min_bytes: 64),
+                                                   stages: gpushader.stages(true, false, false) }])
+    test.assert(list.len(gpushader.layouts_agree(extra, a_shader_source())) > 0)
+
+    test.case("and a source the scan cannot read says so by declaring nothing")
+    test.assert_eq(list.len(gpushader.bindings_of_wgsl("")), 0)
+
+@test
+fn test_a_vertex_stride_that_does_not_hold_its_attributes_is_caught() [io]
+    // The number that is wrong by four in every renderer that has added
+    // an attribute and forgotten it, and whose symptom is geometry that
+    // shears across the screen rather than an error.
+    let position = gpushader.attribute(0, 0, 2)
+    let uv = gpushader.attribute(1, 8, 2)
+
+    test.case("two vec2s need sixteen bytes")
+    test.assert_eq(gpushader.required_stride([position, uv]), 16)
+
+    test.case("a stride of sixteen holds them")
+    test.assert(gpushader.stride_fits(gpushader.vertex_buffer(16, false, [position, uv])))
+
+    test.case("and one of twelve does not")
+    test.assert(gpushader.stride_fits(gpushader.vertex_buffer(12, false, [position, uv])) == false)
+
+    test.case("a per-instance buffer is the same arithmetic")
+    test.assert(gpushader.stride_fits(gpushader.vertex_buffer(8, true,
+                                                              [gpushader.attribute(2, 0, 2)])))
+
+@test
+fn test_an_unfilled_binding_slot_is_the_silent_failure() [io]
+    // A backend that tolerates it reads the texture as transparent
+    // black, so the draw succeeds and draws nothing.
+    let l = gpushader.sampler_texture_layout("quad", 0)
+    let half = gpushader.bind_group("quad", GpuLayoutId { handle: 7 },
+                                    [GpuBindingSlot { binding: 0,
+                                                      value: GpuBindSampler(sampler: GpuSamplerId { handle: 8 }) }])
+
+    test.case("the texture slot is missing")
+    test.assert_eq(list.len(gpushader.missing_bindings(half, l)), 1)
+
+    let whole = gpushader.bind_group("quad", GpuLayoutId { handle: 7 },
+                                     [GpuBindingSlot { binding: 0,
+                                                       value: GpuBindSampler(sampler: GpuSamplerId { handle: 8 }) },
+                                      GpuBindingSlot { binding: 1,
+                                                       value: GpuBindTextureView(view: GpuViewId { handle: 9 }) }])
+
+    test.case("and a full group is missing nothing")
+    test.assert_eq(list.len(gpushader.missing_bindings(whole, l)), 0)
+
+@test
+fn test_a_pipeline_description_names_its_entry_points_and_its_target() [io]
+    let r = gpushader.render_pipeline("quad", GpuShaderId { handle: 1 }, "vs_main", "fs_main",
+                                      GpuBgra8Unorm)
+
+    test.case("the two stages")
+    test.assert_eq_str(r.vertex_entry, "vs_main")
+    test.assert_eq_str(r.fragment_entry, "fs_main")
+
+    test.case("a compute pipeline has one, and derives its layout from the shader")
+    let c = gpushader.compute_pipeline("double", GpuShaderId { handle: 1 }, "main")
+    test.assert_eq_str(c.entry, "main")
+
+// ── the driver seam, implemented ─────────────────────────────────────
+//
+// Everything below is the assertion that the trait is small enough to
+// be implemented by something other than a graphics backend.
+
+// A driver on a machine with no graphics hardware.
+struct NoDriver
+    tried: Int
+
+// Every member answers the same thing a build machine would.
+impl GpuDriver for NoDriver
+    fn adapters(self) -> Result<[GpuAdapterInfo], GpuFault> [io]
+        Ok([])
+
+    fn open_device(self, adapter: GpuAdapterInfo) -> Result<GpuOpenDevice, GpuFault> [io, time]
+        Err(GpuNoAdapter)
+
+    fn create_buffer(self, device: GpuDeviceId,
+                     d: GpuBufferDesc) -> Result<GpuBufferId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_texture(self, device: GpuDeviceId,
+                      d: GpuTextureDesc) -> Result<GpuTextureView, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_sampler(self, device: GpuDeviceId,
+                      d: GpuSamplerDesc) -> Result<GpuSamplerId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_shader(self, device: GpuDeviceId,
+                     d: GpuShaderDesc) -> Result<GpuShaderId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_render_pipeline(self, device: GpuDeviceId,
+                              d: GpuRenderPipelineDesc) -> Result<GpuPipelineId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_compute_pipeline(self, device: GpuDeviceId,
+                               d: GpuComputePipelineDesc) -> Result<GpuPipelineId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_layout(self, device: GpuDeviceId,
+                     d: GpuLayoutDesc) -> Result<GpuLayoutId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_bind_group(self, device: GpuDeviceId,
+                         d: GpuBindGroupDesc) -> Result<GpuBindGroupId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn submit(self, queue: GpuQueueId,
+              l: GpuCommandList) -> Result<GpuSubmission, GpuFault> [io, time]
+        Err(GpuNoAdapter)
+
+    fn read_buffer(self, device: GpuDeviceId, s: GpuSubmission, b: GpuBufferId,
+                   size_bytes: Int) -> Result<Bytes, GpuFault> [io, time]
+        Err(GpuNoAdapter)
+
+    fn release(self, device: GpuDeviceId, r: GpuResource) -> Result<Unit, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+@test
+fn test_the_seam_is_small_enough_for_a_test_to_implement() [io, net, time]
+    let d = NoDriver { tried: 0 }
+
+    test.case("a machine with no graphics hardware answers no adapter")
+    match gpudriver.open_best(d, false)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and every convenience over it fails the same way")
+    let dev = GpuOpenDevice {
+        device: GpuDeviceId { handle: 0 },
+        queue: GpuQueueId { handle: 0 },
+        limits: gpures.baseline_limits(),
+        adapter: GpuAdapterInfo { name: "none", vendor: "none", kind: GpuCpu,
+                                  backend: GpuSoftware, driver: "none" } }
+    match gpudriver.validate_and_submit(d, dev, gpucmd.list("frame"))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    match gpudriver.submit_and_read(d, dev, gpucmd.list("frame"), GpuBufferId { handle: 1 }, 16)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    match gpudriver.create_checked_shader(d, dev, gpushader.shader("s", a_shader_source()),
+                                          ["vs_main", "fs_main"])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    match gpudriver.create_readback_pair(d, dev, "result", 256)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("releasing nothing is not a failure")
+    match gpudriver.release_all(d, dev, [])
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert(true)
+
+@test
+fn test_teardown_has_an_order_and_it_is_not_a_preference() [io]
+    // A backend refuses to release a layout while a pipeline using it
+    // is alive, so the order is published as a rank a caller can sort
+    // by and a test can assert.
+    let group = GpuReleaseBindGroup(id: GpuBindGroupId { handle: 1 })
+    let pipeline = GpuReleasePipeline(id: GpuPipelineId { handle: 2 })
+    let layout = GpuReleaseLayout(id: GpuLayoutId { handle: 3 })
+
+    test.case("a bind group goes before its pipeline")
+    test.assert(gpudriver.release_rank(group) < gpudriver.release_rank(pipeline))
+
+    test.case("and a pipeline before the layout it was built from")
+    test.assert(gpudriver.release_rank(pipeline) < gpudriver.release_rank(layout))
+
+@test
+fn test_a_lost_device_is_a_different_recovery_from_a_refused_submission() [io]
+    // A lost device invalidates every id the driver allocated, so a
+    // program that retried against the same handles retries against
+    // names that no longer mean anything.
+    test.case("a lost device means start again")
+    test.assert(gpudriver.needs_recreate(GpuDeviceLost(reason: "suspended")))
+
+    test.case("and a shader that would not compile does not")
+    test.assert(gpudriver.needs_recreate(GpuShaderFailed(message: "line 3")) == false)

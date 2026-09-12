@@ -1,0 +1,299 @@
+// gpudriver.nv — the boundary, and the only place anything performs.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `GpuDriver` IS THE SEAM, AND IT IS DELIBERATELY SMALL.  Everything
+// this package does — describing a resource, recording a frame,
+// checking a layout against a shader — is a value.  What remains is
+// allocating, compiling, submitting and reading back, and that is this
+// trait.  A shelf binding over a C library implements it; so does the
+// standard library's own `std.gpu` runtime; so does a recording double
+// in a test that has no GPU at all.
+//
+// THE ROWS ARE `[io]` AND `[io, time]`, WHICH IS WHAT THE STANDARD
+// LIBRARY DECLARES MINUS `[ffi]`.  `std.gpu`'s externs read
+// `[io, ffi]`, and `[io, time, ffi]` where the call blocks until the
+// device answers — opening a device, writing a buffer, submitting,
+// reading back.  `[ffi]` is `sys`-only under the layer rules, and that
+// is exactly the point of the trait: the C library stays on the shelf
+// behind an impl, and this package and its consumers stay on the grid.
+// A `sys` impl declares `[io, time, ffi]` against these `[io, time]`
+// members, which is legal because a trait with no effect parameter does
+// not pin its impls' rows.
+//
+// The plan row said `[hw]`/`[gpu]`.  `gpu` is not one of SPEC § 5.1's
+// eleven labels, so it cannot be an effect row; and `[hw]` is a claim
+// the standard library does not make about these same calls.  The rows
+// here are the ones the runtime already declares, which is the answer
+// that cannot be wrong about what the code does.
+//
+// A DEVICE CAN BE LOST AND THE TYPE SAYS SO.  Every call answers a
+// `Result`, and `GpuDeviceLost` is a variant rather than a panic: a
+// laptop that suspends, a driver that updates and a shader that hangs
+// the GPU all produce it, and a program that has to recreate every
+// resource afterwards needs to be told rather than killed.
+//
+// NOTHING IN THIS MODULE DECODES ANYTHING.  The values are gpures's,
+// the lists are gpucmd's, and this is the part that performs.
+
+use gpures
+
+// What a driver can do.
+//
+// Small on purpose: everything else in this package is a value, so this
+// is the whole of what a backend has to provide.  Two very different
+// implementations — a C binding on the shelf and the standard library's
+// own runtime — are plausible because of how little is here.
+//
+// ```novo
+// use gpudriver
+//
+// fn describe() -> Str
+//     "a backend implements these thirteen members and nothing else"
+//
+// fn main() [io]
+//     println(describe())
+// ```
+pub trait GpuDriver
+    // Every adapter the backend can see.  `[io]`: it enumerates
+    // devices and does not block on one.
+    fn adapters(self) -> Result<[GpuAdapterInfo], GpuFault> [io]
+    // Open a device on an adapter, and answer its queue and its
+    // limits.  `[io, time]` — the call blocks until the device is
+    // ready, which is what the standard library's own
+    // `novo_gpu_device_open` declares.
+    fn open_device(self, adapter: GpuAdapterInfo) -> Result<GpuOpenDevice, GpuFault> [io, time]
+    // Allocate a buffer.
+    fn create_buffer(self, device: GpuDeviceId, d: GpuBufferDesc) -> Result<GpuBufferId, GpuFault> [io]
+    // Allocate a texture, and a default view onto the whole of it —
+    // both, because a texture with no view cannot be bound and every
+    // caller makes one immediately.
+    fn create_texture(self, device: GpuDeviceId, d: GpuTextureDesc) -> Result<GpuTextureView, GpuFault> [io]
+    // Allocate a sampler.
+    fn create_sampler(self, device: GpuDeviceId, d: GpuSamplerDesc) -> Result<GpuSamplerId, GpuFault> [io]
+    // Compile WGSL.  The driver's diagnostic travels whole in
+    // `GpuShaderFailed`, because a WGSL error names a line and a
+    // truncated one does not.
+    fn create_shader(self, device: GpuDeviceId, d: GpuShaderDesc) -> Result<GpuShaderId, GpuFault> [io]
+    // Build a render pipeline, and a compute one.
+    fn create_render_pipeline(self, device: GpuDeviceId, d: GpuRenderPipelineDesc) -> Result<GpuPipelineId, GpuFault> [io]
+    fn create_compute_pipeline(self, device: GpuDeviceId, d: GpuComputePipelineDesc) -> Result<GpuPipelineId, GpuFault> [io]
+    // Build a bind group layout, and a bind group in its shape.
+    fn create_layout(self, device: GpuDeviceId, d: GpuLayoutDesc) -> Result<GpuLayoutId, GpuFault> [io]
+    fn create_bind_group(self, device: GpuDeviceId, d: GpuBindGroupDesc) -> Result<GpuBindGroupId, GpuFault> [io]
+    // THE ONE THAT MATTERS.  Replay a recorded list on a queue.  Every
+    // other member allocates; this is where work happens, and it takes
+    // a VALUE rather than a handle a caller mutated.
+    fn submit(self, queue: GpuQueueId, l: GpuCommandList) -> Result<GpuSubmission, GpuFault> [io, time]
+    // Wait for a submission and read a mappable buffer back.  Separate
+    // from `submit` because the wait is the expensive part and a
+    // caller that submitted several lists waits once.
+    fn read_buffer(self, device: GpuDeviceId, s: GpuSubmission, b: GpuBufferId, size_bytes: Int) -> Result<Bytes, GpuFault> [io, time]
+    // Release a resource.  One member rather than eight, taking the
+    // kind, because a driver's release paths are the same call with a
+    // different handle type and eight members would be eight places to
+    // forget one.
+    fn release(self, device: GpuDeviceId, r: GpuResource) -> Result<Unit, GpuFault> [io]
+
+// A device, its queue and what it can do.
+pub struct GpuOpenDevice
+    device: GpuDeviceId
+    queue: GpuQueueId
+    limits: GpuLimits
+    // Which adapter it was opened on, so a program that logs "running
+    // on X" does not have to keep the info separately.
+    adapter: GpuAdapterInfo
+
+// A texture and the view onto the whole of it.
+pub struct GpuTextureView
+    texture: GpuTextureId
+    view: GpuViewId
+
+// Work the driver has accepted.
+//
+// A value rather than nothing, because a readback has to name WHICH
+// submission it is waiting for: a caller that submitted three lists and
+// read back without saying which gets whatever had finished.
+pub struct GpuSubmission
+    handle: Int
+
+// Something to release.
+//
+// One enum rather than eight release members, because a driver's
+// release paths are the same call with a different handle type.
+pub enum GpuResource
+    GpuReleaseBuffer(id: GpuBufferId)
+    GpuReleaseTexture(id: GpuTextureId)
+    GpuReleaseView(id: GpuViewId)
+    GpuReleaseSampler(id: GpuSamplerId)
+    GpuReleaseShader(id: GpuShaderId)
+    GpuReleasePipeline(id: GpuPipelineId)
+    GpuReleaseLayout(id: GpuLayoutId)
+    GpuReleaseBindGroup(id: GpuBindGroupId)
+    GpuReleaseDevice(id: GpuDeviceId)
+
+// Open the best device a driver can see.
+//
+// The three steps every program starts with — enumerate, pick, open —
+// with the preference rule from `gpures.preferred_adapter` and
+// `GpuNoAdapter` when there is nothing.  A headless machine is a real
+// answer and not an error to be assumed away.
+//
+// ```novo
+// use gpudriver
+//
+// fn start(d: dyn GpuDriver) -> Result<GpuOpenDevice, GpuFault> [io, time]
+//     gpudriver.open_best(d, false)
+//
+// fn main() [io]
+//     println("a device, or a reason there is not one")
+// ```
+pub fn open_best(d: dyn GpuDriver,
+                 allow_software: Bool) -> Result<GpuOpenDevice, GpuFault> [io, time]
+    todo("gpu-nv.gpudriver.open_best")
+
+// Check a list against this device's limits, then submit it.
+//
+// The check is not optional here and that is the point: a list that
+// exceeds a workgroup limit or leaves a pass open is a NAMED fault
+// before anything is sent, rather than a driver error afterwards with a
+// handle number in it.  A caller that has already validated calls
+// `GpuDriver.submit` directly.
+//
+// ```novo
+// use gpudriver
+// use gpucmd
+//
+// fn run(d: dyn GpuDriver, dev: GpuOpenDevice, l: GpuCommandList)
+//        -> Result<GpuSubmission, GpuFault> [io, time]
+//     gpudriver.validate_and_submit(d, dev, l)
+//
+// fn main() [io]
+//     println("a frame, checked and sent")
+// ```
+pub fn validate_and_submit(d: dyn GpuDriver, dev: GpuOpenDevice,
+                           l: GpuCommandList) -> Result<GpuSubmission, GpuFault> [io, time]
+    todo("gpu-nv.gpudriver.validate_and_submit")
+
+// Submit a list and read one buffer back, in one call.
+//
+// The compute round trip, which is the shape a caller wants nine times
+// out of ten and which is two calls plus a wait written correctly.
+//
+// ```novo
+// use gpudriver
+// use gpucmd
+//
+// fn compute(d: dyn GpuDriver, dev: GpuOpenDevice, l: GpuCommandList, out: GpuBufferId)
+//            -> Result<Bytes, GpuFault> [io, time]
+//     gpudriver.submit_and_read(d, dev, l, out, 256)
+//
+// fn main() [io]
+//     println("a dispatch, and its answer")
+// ```
+pub fn submit_and_read(d: dyn GpuDriver, dev: GpuOpenDevice, l: GpuCommandList,
+                       readback: GpuBufferId, size_bytes: Int) -> Result<Bytes, GpuFault> [io, time]
+    todo("gpu-nv.gpudriver.submit_and_read")
+
+// Build a shader, checking its entry points before the driver does.
+//
+// A typo in an entry point produces a driver error about a missing
+// function on some backends and a silently unbound stage on others, so
+// the names are checked against the source first and the fault names
+// the one that is missing.
+//
+// ```novo
+// use gpudriver
+// use gpushader
+//
+// fn build(d: dyn GpuDriver, dev: GpuOpenDevice, s: GpuShaderDesc, entries: [Str])
+//          -> Result<GpuShaderId, GpuFault> [io]
+//     gpudriver.create_checked_shader(d, dev, s, entries)
+//
+// fn main() [io]
+//     println("a shader whose entry points exist")
+// ```
+pub fn create_checked_shader(d: dyn GpuDriver, dev: GpuOpenDevice, s: GpuShaderDesc,
+                             entry_points: [Str]) -> Result<GpuShaderId, GpuFault> [io]
+    todo("gpu-nv.gpudriver.create_checked_shader")
+
+// Allocate the pair a compute readback needs.
+//
+// A storage buffer the shader writes and a mappable buffer the host
+// reads, because `storage` and `map_read` are mutually exclusive on
+// every backend.  One call, so the pair cannot be half made.
+//
+// ```novo
+// use gpudriver
+//
+// fn pair(d: dyn GpuDriver, dev: GpuOpenDevice) -> Result<GpuReadbackPair, GpuFault> [io]
+//     gpudriver.create_readback_pair(d, dev, "result", 1024)
+//
+// fn main() [io]
+//     println("a buffer a shader writes and one the host reads")
+// ```
+pub fn create_readback_pair(d: dyn GpuDriver, dev: GpuOpenDevice, label: Str,
+                            size_bytes: Int) -> Result<GpuReadbackPair, GpuFault> [io]
+    todo("gpu-nv.gpudriver.create_readback_pair")
+
+// The two buffers a compute readback needs.
+pub struct GpuReadbackPair
+    storage: GpuBufferId
+    readback: GpuBufferId
+
+// Release several resources, in the order a backend requires.
+//
+// Bind group, pipeline, pipeline layout, bind group layout: a backend
+// refuses to release a layout while a pipeline using it is alive, so
+// the order is not a preference.  Published as a call because it is the
+// teardown every program writes and the one every program writes
+// backwards the first time.
+//
+// ```novo
+// use gpudriver
+//
+// fn tidy(d: dyn GpuDriver, dev: GpuOpenDevice, rs: [GpuResource])
+//         -> Result<Unit, GpuFault> [io]
+//     gpudriver.release_all(d, dev, rs)
+//
+// fn main() [io]
+//     println("resources, released in the order a backend allows")
+// ```
+pub fn release_all(d: dyn GpuDriver, dev: GpuOpenDevice,
+                   resources: [GpuResource]) -> Result<Unit, GpuFault> [io]
+    todo("gpu-nv.gpudriver.release_all")
+
+// The order `release_all` uses, as a value.
+//
+// Published so a caller releasing by hand can sort its own list, and so
+// a test can assert the rule rather than trusting a comment.
+//
+// ```novo
+// use gpudriver
+//
+// fn main() [io]
+//     println("${gpudriver.release_rank(GpuReleaseBindGroup(id: GpuBindGroupId { handle: 1 }))}")
+// ```
+pub fn release_rank(r: GpuResource) -> Int []
+    todo("gpu-nv.gpudriver.release_rank")
+
+// Is this fault one where every resource has to be made again?
+//
+// A lost device invalidates everything the driver allocated, so a
+// program that retried a submission against the same ids retries
+// against handles that no longer name anything.  Published because the
+// recovery is a whole-program one and a caller has to be able to tell
+// it apart from a submission that was merely refused.
+//
+// ```novo
+// use gpudriver
+// use gpures
+//
+// fn start_again(f: GpuFault) -> Bool
+//     gpudriver.needs_recreate(f)
+//
+// fn main() [io]
+//     println("whether everything has to be made again")
+// ```
+pub fn needs_recreate(f: GpuFault) -> Bool []
+    todo("gpu-nv.gpudriver.needs_recreate")

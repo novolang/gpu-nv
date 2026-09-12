@@ -1,0 +1,319 @@
+// gpucmd.nv — the work, as a list a host submits.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LOAD-BEARING INTERFACE OF THIS PACKAGE IS `GpuCommand`, AND WHAT
+// IT CARRIES IS THAT RECORDING AND SUBMITTING ARE DIFFERENT ACTS.
+// Every graphics API models a frame as an encoder a caller mutates —
+// begin a pass, set a pipeline, draw, end, finish, submit — and every
+// one of those calls performs something.  Here the whole recording is a
+// VALUE: a list of commands built with no device present, checked with
+// no device present, and handed to a driver in one call.
+//
+// Four things fall out of that and none of them is available to an
+// encoder:
+//
+//   * a frame can be built on one cell and submitted on another,
+//     because a list is data and an encoder is a handle;
+//   * a test can assert what WOULD have been submitted, on a machine
+//     with no GPU, which is how the render half of a terminal becomes
+//     testable at all;
+//   * `validate` is a function rather than a driver's run-time refusal,
+//     so a pass with no pipeline set is a named fault at build time;
+//   * the driver trait shrinks to `submit`, which is what makes two
+//     very different backends plausible implementations of it.
+//
+// THE COST IS THAT A LIST CANNOT BRANCH ON A RESULT.  An encoder can
+// read a query and decide what to draw next; a list is decided before
+// it is submitted.  That is a real limitation, it is what occlusion
+// culling and GPU-driven rendering need, and it is named in the README
+// rather than discovered — the answer is two submissions with a
+// readback between them, which costs a round trip.
+//
+// A PASS IS A RANGE AND NOT A NESTED VALUE.  `GpuBeginRenderPass` and
+// `GpuEndPass` are commands in the same flat list rather than a pass
+// holding its own commands, because a flat list is what a driver
+// replays and because a nested value makes `validate` a tree walk
+// instead of a state machine.  The cost is that an unbalanced list is
+// expressible; `validate` is what makes it a named fault.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use gpures
+
+// One recorded command.
+//
+// The set is deliberately small: what a 2D renderer, a compute
+// dispatch and a readback need, and nothing else.  A backend feature
+// this list cannot express is a row for a later version rather than an
+// escape hatch here, because an escape hatch would be a second way to
+// do everything.
+pub enum GpuCommand
+    // Begin a render pass that clears its target.  A pass that loads
+    // the previous contents instead is `GpuBeginRenderPassLoad`.
+    GpuBeginRenderPass(target: GpuViewId, r: Float, g: Float, b: Float, a: Float)
+    // Begin a render pass that keeps what was there.
+    GpuBeginRenderPassLoad(target: GpuViewId)
+    // Begin a compute pass.
+    GpuBeginComputePass
+    // End whichever pass is open.
+    GpuEndPass
+    GpuSetPipeline(pipeline: GpuPipelineId)
+    GpuSetBindGroup(slot: Int, group: GpuBindGroupId)
+    // Bind a vertex buffer, or a sub-range of one — which is what lets
+    // a frame's quads live in ONE buffer written once and drawn in
+    // slices.
+    GpuSetVertexBuffer(slot: Int, buffer: GpuBufferId, offset_bytes: Int, size_bytes: Int)
+    GpuDraw(vertex_count: Int, instance_count: Int)
+    GpuDispatch(x: Int, y: Int, z: Int)
+    // Write host bytes into a buffer.  The bytes travel with the
+    // command, so a list is self-contained and a submission needs no
+    // second argument.
+    GpuWriteBuffer(buffer: GpuBufferId, offset_bytes: Int, data: Bytes)
+    GpuWriteTexture(texture: GpuTextureId, width: Int, height: Int, data: Bytes)
+    GpuCopyBuffer(src: GpuBufferId, src_offset: Int, dst: GpuBufferId, dst_offset: Int,
+                  size_bytes: Int)
+    // Copy a texture into a buffer, for a host readback.
+    // `bytes_per_row` must be a multiple of the alignment — see
+    // `gpures.padded_row_bytes`, and see `GpuBadRowAlignment` for what
+    // ignoring it produces.
+    GpuCopyTextureToBuffer(texture: GpuTextureId, width: Int, height: Int, dst: GpuBufferId,
+                           bytes_per_row: Int)
+    // A label a driver's debug layer and a capture tool will show.
+    // Free, and the difference between a capture a person can read and
+    // four hundred unnamed draws.
+    GpuPushLabel(name: Str)
+    GpuPopLabel
+
+// A recorded submission.
+//
+// A value: build it, check it, send it.
+pub struct GpuCommandList
+    label: Str
+    commands: [GpuCommand]
+
+// Why a list is not a legal submission.
+pub enum GpuListFault
+    // A draw or a dispatch outside any pass.
+    GpuOutsidePass(at: Int)
+    // A pass begun while another was open.
+    GpuPassAlreadyOpen(at: Int)
+    // An end with no pass open.
+    GpuNoPassOpen(at: Int)
+    // The list ended with a pass still open.
+    GpuPassNotEnded(at: Int)
+    // A draw with no pipeline set in this pass.
+    GpuNoPipeline(at: Int)
+    // A draw in a compute pass, or a dispatch in a render pass.
+    GpuWrongPassKind(at: Int, command: Str)
+    // A dispatch past the adapter's workgroup limit.  Checked here,
+    // against limits the caller read, so it is a build-time fault
+    // rather than a driver's refusal.
+    GpuDispatchTooLarge(at: Int, axis: Str, asked: Int, allowed: Int)
+    // A texture-to-buffer copy whose row stride is not aligned.
+    GpuUnalignedCopy(at: Int, bytes_per_row: Int, alignment: Int)
+    // A label pushed and never popped, or popped with none pushed.
+    GpuUnbalancedLabels(at: Int)
+
+// The standard `Error` implementation.
+impl Error for GpuListFault
+    // One line: which command, by position, and what was wrong.
+    fn message(self) -> Str
+        todo("gpu-nv.gpucmd.GpuListFault.message")
+
+// An empty list.
+//
+// ```novo
+// use gpucmd
+//
+// fn frame() -> GpuCommandList
+//     gpucmd.list("frame")
+//
+// fn main() [io]
+//     println("a frame with nothing in it yet")
+// ```
+pub fn list(label: Str) -> GpuCommandList []
+    todo("gpu-nv.gpucmd.list")
+
+// The list with one more command on the end.
+//
+// A value in and a value out, so a frame is built by folding rather
+// than by mutating — which is what lets one be built in a pure function
+// and sent to whatever holds the device.
+//
+// ```novo
+// use gpucmd
+//
+// fn plus(l: GpuCommandList, c: GpuCommand) -> GpuCommandList
+//     gpucmd.push(l, c)
+//
+// fn main() [io]
+//     println("one more command")
+// ```
+pub fn push(l: GpuCommandList, c: GpuCommand) -> GpuCommandList []
+    todo("gpu-nv.gpucmd.push")
+
+// The list with several more commands on the end.
+//
+// ```novo
+// use gpucmd
+//
+// fn plus(l: GpuCommandList, cs: [GpuCommand]) -> GpuCommandList
+//     gpucmd.extend(l, cs)
+//
+// fn main() [io]
+//     println("a batch of commands")
+// ```
+pub fn extend(l: GpuCommandList, cs: [GpuCommand]) -> GpuCommandList []
+    todo("gpu-nv.gpucmd.extend")
+
+// How many commands a list holds.
+//
+// ```novo
+// use gpucmd
+//
+// fn main() [io]
+//     println("${gpucmd.length(gpucmd.list("frame"))}")
+// ```
+pub fn length(l: GpuCommandList) -> Int []
+    todo("gpu-nv.gpucmd.length")
+
+// Is this a submission a driver will accept?
+//
+// Answers EVERY fault rather than the first, because a frame built by a
+// renderer usually has one kind of mistake repeated and fixing them one
+// error at a time is one round trip per draw call.
+//
+// The limits are an argument, so the same list can be checked against
+// two adapters — which is exactly what a program that ships to both a
+// laptop and a workstation wants to do in a test.
+//
+// ```novo
+// use gpucmd
+// use gpures
+//
+// fn ok(l: GpuCommandList) -> Bool
+//     list.len(gpucmd.validate(l, gpures.baseline_limits())) == 0
+//
+// fn main() [io]
+//     println("whether a frame is a legal submission")
+// ```
+pub fn validate(l: GpuCommandList, limits: GpuLimits) -> [GpuListFault] []
+    todo("gpu-nv.gpucmd.validate")
+
+// A render pass that clears, as the two commands it is.
+//
+// The convenience that keeps `GpuEndPass` from being forgotten: takes
+// the commands inside the pass and answers the whole balanced run.
+//
+// ```novo
+// use gpucmd
+// use gpures
+//
+// fn whole_pass(target: GpuViewId, inner: [GpuCommand]) -> [GpuCommand]
+//     gpucmd.render_pass(target, 0.0, 0.0, 0.0, 1.0, inner)
+//
+// fn main() [io]
+//     println("a pass that cannot be left open")
+// ```
+pub fn render_pass(target: GpuViewId, r: Float, g: Float, b: Float, a: Float,
+                   inner: [GpuCommand]) -> [GpuCommand] []
+    todo("gpu-nv.gpucmd.render_pass")
+
+// A compute pass, the same way.
+//
+// ```novo
+// use gpucmd
+//
+// fn whole_pass(inner: [GpuCommand]) -> [GpuCommand]
+//     gpucmd.compute_pass(inner)
+//
+// fn main() [io]
+//     println("a compute pass that cannot be left open")
+// ```
+pub fn compute_pass(inner: [GpuCommand]) -> [GpuCommand] []
+    todo("gpu-nv.gpucmd.compute_pass")
+
+// The whole of a compute round trip, as one list.
+//
+// Write the input, dispatch, copy the result into a mappable buffer,
+// and stop.  Named because the copy step is the one everybody leaves
+// out — `storage` and `map_read` are mutually exclusive, so a result a
+// shader wrote cannot be read by the host without it, and a program
+// that tried gets a driver error about a buffer rather than about the
+// rule.
+//
+// ```novo
+// use gpucmd
+//
+// fn work(pipeline: GpuPipelineId, group: GpuBindGroupId, input: GpuBufferId,
+//         output: GpuBufferId, data: Bytes) -> GpuCommandList
+//     gpucmd.compute_round_trip(pipeline, group, input, output, data, 64)
+//
+// fn main() [io]
+//     println("a dispatch and the copy that makes it readable")
+// ```
+pub fn compute_round_trip(pipeline: GpuPipelineId, group: GpuBindGroupId, input: GpuBufferId,
+                          readback: GpuBufferId, data: Bytes, groups_x: Int) -> GpuCommandList []
+    todo("gpu-nv.gpucmd.compute_round_trip")
+
+// How many workgroups a dispatch needs to cover this many items.
+//
+// The ceiling division everybody writes as `n / size` and gets wrong
+// for the last partial group — which leaves the tail of the data
+// untouched, with no error, on exactly the inputs whose length is not a
+// multiple of the workgroup size.
+//
+// ```novo
+// use gpucmd
+//
+// fn main() [io]
+//     println("${gpucmd.workgroups_for(1000, 64)}")
+// ```
+pub fn workgroups_for(items: Int, workgroup_size: Int) -> Int []
+    todo("gpu-nv.gpucmd.workgroups_for")
+
+// Does this list touch this buffer?
+//
+// For a caller deciding whether a buffer is still in flight, and for a
+// test asserting that a frame wrote what it was supposed to.
+//
+// ```novo
+// use gpucmd
+//
+// fn used(l: GpuCommandList, b: GpuBufferId) -> Bool
+//     gpucmd.uses_buffer(l, b)
+//
+// fn main() [io]
+//     println("whether a frame touches a buffer")
+// ```
+pub fn uses_buffer(l: GpuCommandList, b: GpuBufferId) -> Bool []
+    todo("gpu-nv.gpucmd.uses_buffer")
+
+// How many draws and dispatches a list holds.
+//
+// The number a frame budget is about, and the one a profiler reports.
+// Published so a renderer can assert its own batching in a test —
+// "this frame is one draw" is a property worth defending, and without
+// a count it can only be checked by looking at a capture.
+//
+// ```novo
+// use gpucmd
+//
+// fn work(l: GpuCommandList) -> GpuWorkCount
+//     gpucmd.work_count(l)
+//
+// fn main() [io]
+//     println("how much work a frame asks for")
+// ```
+pub fn work_count(l: GpuCommandList) -> GpuWorkCount []
+    todo("gpu-nv.gpucmd.work_count")
+
+// What a list would actually do.
+pub struct GpuWorkCount
+    draws: Int
+    dispatches: Int
+    passes: Int
+    // Host bytes the list carries, which is what a submission has to
+    // copy before it returns.
+    upload_bytes: Int

@@ -1,0 +1,498 @@
+// gpures.nv — the adapter, the device and the four things a program
+// allocates, as values.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A RESOURCE IS A NAME AND NOT THE THING.  `GpuBufferId`,
+// `GpuTextureId`, `GpuShaderId` and the rest are ids the DRIVER
+// allocated: the memory lives on the other side of the boundary, this
+// package never holds it, and the whole surface is therefore values
+// that can be recorded, compared, logged and sent between cells.  That
+// is what lets a command list be built on one thread and submitted on
+// another, and it is why every type here ends in `Id` — a reader should
+// never be in doubt about which side of the boundary a value lives on.
+//
+// THE IDS ARE DISTINCT TYPES ON PURPOSE.  A single `GpuHandle` would be
+// one integer everywhere and a caller that passed a texture where a
+// buffer belonged would find out from a driver error at run time, in a
+// message about a handle number.  Four types cost nothing and make the
+// mistake a type error.
+//
+// A DESCRIPTOR IS SEPARATE FROM THE ID IT PRODUCES, because the
+// descriptor is what a caller can BUILD AND CHECK with no device
+// present: a test can assert that a pipeline's vertex stride matches
+// its shader's declared layout, and a build script can validate every
+// descriptor in a program without a GPU on the machine.
+//
+// THE LIMITS ARE READ AND NOT ASSUMED.  A workgroup size, a bind-group
+// count, a maximum buffer size and a texture dimension are all
+// per-adapter, and every one of them is a number a program silently
+// exceeds on the smaller of two machines.  `GpuLimits` is what the
+// driver answered, and `fits_limits` is the check published so a caller
+// makes it before the allocation rather than after the failure.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+// Which graphics API is underneath.
+//
+// Not a detail: a shader that validates under one backend's WGSL
+// implementation can fail under another's, a workgroup limit differs,
+// and a program that wants to report "no GPU" honestly has to be able
+// to say which backends it looked for.
+pub enum GpuBackend
+    GpuVulkan
+    GpuMetal
+    GpuDirect3d12
+    GpuWebGpu
+    // A software rasteriser.  Reported rather than hidden, because a
+    // program that silently ran on one is a program whose benchmark
+    // means nothing.
+    GpuSoftware
+
+// What kind of adapter this is.
+pub enum GpuAdapterKind
+    GpuDiscrete
+    GpuIntegrated
+    GpuCpu
+    GpuVirtual
+
+// What the driver said about an adapter.
+pub struct GpuAdapterInfo
+    name: Str
+    vendor: Str
+    kind: GpuAdapterKind
+    backend: GpuBackend
+    // The driver's own version string, because a shader that fails to
+    // compile on one driver version and not another is a bug report
+    // that needs it.
+    driver: Str
+
+// The numbers a program may not exceed on this adapter.
+//
+// Every one of them is a value a program silently exceeds on the
+// smaller of two machines, so they are read from the device rather than
+// assumed.
+pub struct GpuLimits
+    max_buffer_bytes: Int
+    max_texture_dimension_2d: Int
+    max_bind_groups: Int
+    max_bindings_per_bind_group: Int
+    max_vertex_buffers: Int
+    max_compute_workgroup_size_x: Int
+    max_compute_workgroup_size_y: Int
+    max_compute_workgroup_size_z: Int
+    max_compute_invocations_per_workgroup: Int
+    max_compute_workgroups_per_dimension: Int
+    // The alignment a buffer copy's row stride must satisfy: 256 on
+    // every backend, and the one constant that makes a texture readback
+    // silently wrong when it is ignored.
+    copy_bytes_per_row_alignment: Int
+
+// A device the driver opened.
+pub struct GpuDeviceId
+    handle: Int
+
+// The queue commands are submitted to.
+//
+// Separate from the device because a device may have several, and
+// because a submission names one — a package that assumed the default
+// queue could not express a compute queue running beside a graphics
+// one.
+pub struct GpuQueueId
+    handle: Int
+
+// A buffer the driver allocated.
+pub struct GpuBufferId
+    handle: Int
+
+// A texture the driver allocated.
+pub struct GpuTextureId
+    handle: Int
+
+// A view onto part of a texture.
+//
+// A separate id because a texture is bound to a shader THROUGH a view,
+// and one texture has several — a mip level, an array layer, a
+// different format reading the same bytes.
+pub struct GpuViewId
+    handle: Int
+
+// A sampler.
+pub struct GpuSamplerId
+    handle: Int
+
+// A compiled shader module.
+pub struct GpuShaderId
+    handle: Int
+
+// A pipeline, render or compute.
+pub struct GpuPipelineId
+    handle: Int
+
+// A bind group layout: the SHAPE of a binding set.
+pub struct GpuLayoutId
+    handle: Int
+
+// A bind group: actual resources, in a layout's shape.
+pub struct GpuBindGroupId
+    handle: Int
+
+// What a buffer may be used for.
+//
+// A set rather than a flavour, because the combinations are what
+// matter: `MapRead` and `Storage` are mutually exclusive on every
+// backend, which is why a compute readback needs a copy step and why a
+// package that offered three named buffer kinds could not say so.
+pub struct GpuBufferUsage
+    copy_src: Bool
+    copy_dst: Bool
+    // Read or written by a shader.
+    storage: Bool
+    uniform: Bool
+    vertex: Bool
+    index: Bool
+    // Mappable for the host to read.  Not combinable with `storage`.
+    map_read: Bool
+    map_write: Bool
+
+// How to allocate a buffer.
+pub struct GpuBufferDesc
+    label: Str
+    size_bytes: Int
+    usage: GpuBufferUsage
+
+// A texture's pixel format.
+//
+// The four a 2D renderer and a compute readback actually use.  A format
+// this package does not name travels as `GpuFormatOther` with its
+// driver code, so an application that needs a depth format or a
+// compressed one is not blocked by this enum.
+pub enum GpuTextureFormat
+    GpuRgba8Unorm
+    GpuRgba8UnormSrgb
+    GpuBgra8Unorm
+    GpuRgba32Float
+    GpuFormatOther(code: Int)
+
+// How to allocate a texture.
+pub struct GpuTextureDesc
+    label: Str
+    width: Int
+    height: Int
+    format: GpuTextureFormat
+    // Bound to a shader.
+    texture_binding: Bool
+    // Written by a render pass.
+    render_attachment: Bool
+    copy_src: Bool
+    copy_dst: Bool
+
+// How a sampler reads a texture.
+pub struct GpuSamplerDesc
+    label: Str
+    // Nearest-neighbour rather than linear.  The glyph-atlas default:
+    // linear filtering on a text atlas produces the blurred edges every
+    // terminal emulator has shipped by accident at least once.
+    nearest: Bool
+    // Clamp to the edge rather than repeat.
+    clamp: Bool
+
+// Why a resource call did not happen.
+pub enum GpuFault
+    // No adapter at all.  A real answer on a headless machine, and the
+    // one a program must handle rather than assume away.
+    GpuNoAdapter
+    // An adapter exists and the device would not open.
+    GpuDeviceLost(reason: Str)
+    // A descriptor exceeds one of the adapter's limits.  Named with the
+    // limit and the value, because "invalid buffer size" tells a person
+    // nothing about a number they are looking straight at.
+    GpuOverLimit(limit: Str, asked: Int, allowed: Int)
+    // A buffer usage set the backend refuses — `storage` and
+    // `map_read` together, most often.
+    GpuBadUsage(detail: Str)
+    // The shader did not compile.  The driver's own message, whole,
+    // because a WGSL diagnostic names a line and a truncated one does
+    // not.
+    GpuShaderFailed(message: Str)
+    // A command list that does not describe a legal submission.
+    GpuBadCommandList(detail: Str)
+    // A row stride that is not a multiple of the alignment.  Its own
+    // variant because the result of ignoring it is a readback that
+    // succeeds and is skewed.
+    GpuBadRowAlignment(bytes_per_row: Int, alignment: Int)
+    // The driver said something this package does not model.
+    GpuDriverError(code: Int, message: Str)
+
+// The standard `Error` implementation, so a GPU failure can be reported
+// by anything that reports errors.
+impl Error for GpuFault
+    // One line: what was asked for, and what the driver said.
+    fn message(self) -> Str
+        todo("gpu-nv.gpures.GpuFault.message")
+
+// A buffer usage set with nothing in it.
+//
+// The starting value a caller adds to, so a usage is assembled by
+// naming what it needs rather than by remembering eight booleans in
+// order.
+//
+// ```novo
+// use gpures
+//
+// fn none() -> GpuBufferUsage
+//     gpures.no_usage()
+//
+// fn main() [io]
+//     println("a buffer that may be used for nothing")
+// ```
+pub fn no_usage() -> GpuBufferUsage []
+    todo("gpu-nv.gpures.no_usage")
+
+// The usage a compute shader's working buffer needs.
+//
+// `CopySrc | CopyDst | Storage`.  Named because it is the one every
+// compute program starts from, and because the fact it does NOT include
+// `map_read` is the reason a readback needs a copy.
+//
+// ```novo
+// use gpures
+//
+// fn working() -> GpuBufferUsage
+//     gpures.storage_usage()
+//
+// fn main() [io]
+//     println("what a compute buffer is for")
+// ```
+pub fn storage_usage() -> GpuBufferUsage []
+    todo("gpu-nv.gpures.storage_usage")
+
+// The usage a host readback buffer needs.
+//
+// `CopyDst | MapRead`, and it may not also be `storage` — which is the
+// whole reason a compute result is copied from a storage buffer into
+// one of these before it is read.
+//
+// ```novo
+// use gpures
+//
+// fn readback() -> GpuBufferUsage
+//     gpures.read_usage()
+//
+// fn main() [io]
+//     println("what the host can read")
+// ```
+pub fn read_usage() -> GpuBufferUsage []
+    todo("gpu-nv.gpures.read_usage")
+
+// Is this usage set one a backend will accept?
+//
+// `storage` with `map_read` is the combination every backend refuses,
+// and a caller that asked for it gets a driver error about a buffer
+// rather than about the rule.
+//
+// ```novo
+// use gpures
+//
+// fn ok(u: GpuBufferUsage) -> Bool
+//     gpures.usage_is_legal(u)
+//
+// fn main() [io]
+//     println("whether a buffer usage is one a backend allows")
+// ```
+pub fn usage_is_legal(u: GpuBufferUsage) -> Bool []
+    todo("gpu-nv.gpures.usage_is_legal")
+
+// A buffer descriptor.
+//
+// ```novo
+// use gpures
+//
+// fn scratch() -> GpuBufferDesc
+//     gpures.buffer("scratch", 4096, gpures.storage_usage())
+//
+// fn main() [io]
+//     println("a buffer, described")
+// ```
+pub fn buffer(label: Str, size_bytes: Int, usage: GpuBufferUsage) -> GpuBufferDesc []
+    todo("gpu-nv.gpures.buffer")
+
+// A 2D texture descriptor that can be both rendered to and sampled
+// from.
+//
+// The offscreen-render shape, which is what a test and a thumbnailer
+// both want and what a package with only a "render target" and only a
+// "sampled texture" cannot express.
+//
+// ```novo
+// use gpures
+//
+// fn target() -> GpuTextureDesc
+//     gpures.texture_2d("offscreen", 64, 64, GpuRgba8Unorm)
+//
+// fn main() [io]
+//     println("a texture that is both a target and a source")
+// ```
+pub fn texture_2d(label: Str, width: Int, height: Int,
+                  format: GpuTextureFormat) -> GpuTextureDesc []
+    todo("gpu-nv.gpures.texture_2d")
+
+// A sampler descriptor with nearest filtering and clamped addressing.
+//
+// ```novo
+// use gpures
+//
+// fn crisp() -> GpuSamplerDesc
+//     gpures.sampler_nearest_clamp("atlas")
+//
+// fn main() [io]
+//     println("the sampler a glyph atlas wants")
+// ```
+pub fn sampler_nearest_clamp(label: Str) -> GpuSamplerDesc []
+    todo("gpu-nv.gpures.sampler_nearest_clamp")
+
+// How many bytes one row of this texture occupies.
+//
+// The number a readback's `bytes_per_row` must be a multiple of the
+// alignment of.  Published because computing it as `width * 4` is right
+// for `Rgba8` and wrong for everything else, and the failure is a
+// skewed image rather than an error.
+//
+// ```novo
+// use gpures
+//
+// fn main() [io]
+//     println("${gpures.row_bytes(GpuRgba8Unorm, 64)}")
+// ```
+pub fn row_bytes(format: GpuTextureFormat, width: Int) -> Int []
+    todo("gpu-nv.gpures.row_bytes")
+
+// The row stride a copy must use: the row bytes, rounded up to the
+// alignment.
+//
+// 256 on every backend.  A caller that passed the unpadded row gets a
+// readback that succeeds and is sheared, one row further out of place
+// per row — which is the single most recognisable wrong answer in
+// graphics programming and has no error attached to it.
+//
+// ```novo
+// use gpures
+//
+// fn main() [io]
+//     println("${gpures.padded_row_bytes(GpuRgba8Unorm, 65, 256)}")
+// ```
+pub fn padded_row_bytes(format: GpuTextureFormat, width: Int, alignment: Int) -> Int []
+    todo("gpu-nv.gpures.padded_row_bytes")
+
+// How many bytes a pixel of this format takes.
+//
+// ```novo
+// use gpures
+//
+// fn main() [io]
+//     println("${gpures.format_bytes(GpuRgba32Float)}")
+// ```
+pub fn format_bytes(format: GpuTextureFormat) -> Int []
+    todo("gpu-nv.gpures.format_bytes")
+
+// Does this buffer descriptor fit the adapter's limits?
+//
+// The check published so a caller makes it before the allocation rather
+// than after the failure — and answers WHICH limit, because a program
+// that is over one of nine wants to be told which.
+//
+// ```novo
+// use gpures
+//
+// fn ok(d: GpuBufferDesc, l: GpuLimits) -> Bool
+//     match gpures.fits_limits(d, l)
+//         Some(f) => false
+//         None    => true
+//
+// fn main() [io]
+//     println("whether a buffer fits this adapter")
+// ```
+pub fn fits_limits(d: GpuBufferDesc, l: GpuLimits) -> ?GpuFault []
+    todo("gpu-nv.gpures.fits_limits")
+
+// Does this texture descriptor fit?
+//
+// ```novo
+// use gpures
+//
+// fn ok(d: GpuTextureDesc, l: GpuLimits) -> Bool
+//     match gpures.texture_fits_limits(d, l)
+//         Some(f) => false
+//         None    => true
+//
+// fn main() [io]
+//     println("whether a texture fits this adapter")
+// ```
+pub fn texture_fits_limits(d: GpuTextureDesc, l: GpuLimits) -> ?GpuFault []
+    todo("gpu-nv.gpures.texture_fits_limits")
+
+// The limits every backend is required to support.
+//
+// The floor a program can rely on without asking, and the value to
+// write a test against — a program that stayed inside these runs
+// everywhere, and one that did not has to check.
+//
+// ```novo
+// use gpures
+//
+// fn main() [io]
+//     println("${gpures.baseline_limits().max_bind_groups}")
+// ```
+pub fn baseline_limits() -> GpuLimits []
+    todo("gpu-nv.gpures.baseline_limits")
+
+// Is this adapter one a program should refuse?
+//
+// A software rasteriser answers `true`: it works, it is a thousand
+// times slower, and a program that silently ran on one is a program
+// whose benchmark means nothing and whose user thinks their machine is
+// broken.  A caller that WANTS one — a test, a CI run — says so.
+//
+// ```novo
+// use gpures
+//
+// fn slow(a: GpuAdapterInfo) -> Bool
+//     gpures.is_software(a)
+//
+// fn main() [io]
+//     println("whether an adapter is a software rasteriser")
+// ```
+pub fn is_software(a: GpuAdapterInfo) -> Bool []
+    todo("gpu-nv.gpures.is_software")
+
+// The best adapter out of a list, by a simple rule.
+//
+// Discrete over integrated over software, and the first of equals.
+// Published rather than left to a caller because every program writes
+// this and half of them take the first adapter, which on a laptop with
+// two is the integrated one.
+//
+// ```novo
+// use gpures
+//
+// fn best(all: [GpuAdapterInfo]) -> Bool
+//     match gpures.preferred_adapter(all, false)
+//         Some(a) => true
+//         None    => false
+//
+// fn main() [io]
+//     println("the adapter a program should pick")
+// ```
+pub fn preferred_adapter(all: [GpuAdapterInfo], allow_software: Bool) -> ?GpuAdapterInfo []
+    todo("gpu-nv.gpures.preferred_adapter")
+
+// The backend's name, as a person would write it.
+//
+// ```novo
+// use gpures
+//
+// fn main() [io]
+//     println(gpures.backend_name(GpuVulkan))
+// ```
+pub fn backend_name(b: GpuBackend) -> Str []
+    todo("gpu-nv.gpures.backend_name")
