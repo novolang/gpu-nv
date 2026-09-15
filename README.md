@@ -1,272 +1,293 @@
 # gpu-nv
 
-`std.gpu` as a package: the device, the buffers and the pipelines as
-values, a frame as a list a host submits, and the driver as a trait.
+WebGPU is a graphics and compute API for the GPU, specified by the W3C in
+[the WebGPU specification](https://www.w3.org/TR/webgpu/) with
+[WGSL](https://www.w3.org/TR/WGSL/) as its shading language. This package is
+that model in novo-lang, as values: the adapter, the device, the buffers, the
+textures, the pipelines and the bind groups are descriptions a program builds
+and checks with no device present, a frame is a list of commands, and the one
+thing that talks to hardware is a trait a program supplies an implementation
+of.
 
-**Status: NOT IMPLEMENTED — interface only.**  Every `pub fn` body is a
-`todo()`, so the signatures, the effect rows and the tests are published
-and nothing is implemented.  The first implementation is the `0.1.0`
-published over this.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
+its full signature, but every body is a `todo()` that panics when called. The
+package is published so its design can be reviewed and depended on before it
+is implemented. Version 0.1.0 will be the first working release.
 
-## What this is
+## What it is
 
-The standard library binds wgpu-native through about sixty `@ffi`
-externs, and a program using them holds raw handle integers, calls
-`novo_gpu_encoder_begin`, mutates an encoder and submits it.  That
-surface works — the acceptance probes render offscreen and read pixels
-back — and it cannot be tested, cannot be sent between cells, and cannot
-be implemented by anything but wgpu-native.
+An **adapter** is one GPU the machine can see. A **device** is an open
+connection to one, and it comes with a **queue**, which is what work is
+submitted to. Every adapter has **limits**: the largest buffer, the largest
+texture, how many bind groups a pipeline may have, and how large a compute
+dispatch may be. Limits differ between machines, so a program reads them
+rather than assuming them.
 
-This package is the same model as values, with one trait at the
-boundary.
+A **buffer** is a block of memory on the device. A **texture** is an image on
+the device, and a **view** is a window onto part of one. A **sampler** says how
+a shader reads a texture. A **shader module** is compiled WGSL source. A
+**pipeline** is a shader plus everything fixed about how it runs.
 
-| surface | module | reach for it when |
-| --- | --- | --- |
-| the **resources** | `gpures` | you are allocating anything |
-| the **frame** | `gpucmd` | you are recording work |
-| the **shader** | `gpushader` | you are writing WGSL or a layout |
-| the **boundary** | `gpudriver` | you are actually talking to a GPU |
+A shader reads its inputs through **bindings**, numbered slots grouped into
+**bind groups**. A **bind group layout** is the shape of one group: which slot
+holds a uniform buffer, which holds a texture, which holds a sampler. A bind
+group is that shape filled in with actual resources.
 
-51 public functions, one trait with thirteen members, every body a
-`todo()`.
+In this package none of those is the thing itself. Each is an **id** the driver
+allocated, and the memory lives on the other side of the boundary. Every id is
+its own type, so passing a texture where a buffer belongs is a type error
+rather than a driver message about a handle number.
 
-## The load-bearing interface
+Work is recorded rather than performed. A **command list** is a flat list of
+commands with a label: begin a pass, set a pipeline, set a bind group, draw,
+dispatch, copy, end the pass. Recording it needs no device. Submitting it is
+one call on the driver.
 
-```novo norun:pseudo
-pub enum GpuCommand
-    GpuBeginRenderPass(target: GpuViewId, r: Float, g: Float, b: Float, a: Float)
-    GpuSetPipeline(pipeline: GpuPipelineId)
-    GpuDraw(vertex_count: Int, instance_count: Int)
-    GpuDispatch(x: Int, y: Int, z: Int)
-    // … eleven more
+| Quantity | Value |
+| --- | --- |
+| Modules that perform anything | 1 of 4 |
+| Members on the `GpuDriver` trait | 13 |
+| Commands `GpuCommand` can hold | 15 kinds |
+| Faults `gpucmd.validate` can report | 9 kinds |
+| Copy row alignment required by WebGPU | 256 bytes |
+| Smallest `maxTextureDimension2D` any backend must support | 8192 |
+| Smallest `maxBindGroups` any backend must support | 4 |
 
-pub struct GpuCommandList
-    label: Str
-    commands: [GpuCommand]
+## Install
+
+```
+novo pkg add gpu-nv
 ```
 
-**Recording and submitting are different acts.**  Every graphics API
-models a frame as an encoder a caller mutates — begin a pass, set a
-pipeline, draw, end, finish, submit — and every one of those calls
-performs something.  Here the whole recording is a value: built with no
-device present, checked with no device present, and handed to a driver
-in one call.
-
-Four things follow, and none of them is available to an encoder:
-
-- **A frame can be built on one cell and submitted on another**, because
-  a list is data and an encoder is a handle.
-- **A test can assert what would have been submitted**, on a machine
-  with no GPU.  `tests/command_tests.nv` is the whole of a renderer's
-  correctness checked on a build machine, which is the difference
-  between a render path with tests and one without.
-- **`gpucmd.validate` is a function**, so a pass with no pipeline set, a
-  dispatch past the adapter's workgroup limit and a texture copy with an
-  unaligned row stride are named faults at a position in a list, rather
-  than driver errors at run time with a handle number in the message.
-- **The driver trait shrinks to `submit`**, which is what makes two very
-  different backends plausible implementations of it.
-
-**The cost is that a list cannot branch on a result.**  An encoder can
-read an occlusion query and decide what to draw next; a list is decided
-before it is submitted.  That is real, it is what GPU-driven rendering
-needs, and the answer here is two submissions with a readback between
-them — which costs a round trip.  Named rather than discovered.
-
-## The one example that will work
+## Example
 
 ```novo
 use gpucmd
 use gpures
 
-// A frame, recorded with no device in the room and checked against the
-// limits every backend must meet.
-fn clear_frame(target: GpuViewId) -> Int
-    let l = gpucmd.extend(gpucmd.list("frame"),
-                          gpucmd.render_pass(target, 0.0, 0.0, 0.0, 1.0, []))
-    list.len(gpucmd.validate(l, gpures.baseline_limits()))
-
 fn main() [io]
-    println("a frame, checked before anything is sent")
+    // A view onto the texture this frame draws into. A driver answers
+    // one from `create_texture`; the id stands in for it here.
+    let target = GpuViewId { handle: 1 }
+
+    // One frame, recorded with no device present: a pass that clears to
+    // opaque black, and the command that ends it.
+    let frame = gpucmd.extend(gpucmd.list("frame"),
+                              gpucmd.render_pass(target, 0.0, 0.0, 0.0, 1.0, []))
+
+    // Every reason a driver would refuse this list, found before it is
+    // sent, against the limits every backend is required to support.
+    for f in gpucmd.validate(frame, gpures.baseline_limits())
+        println("this frame would be refused")
+
+    // How many commands the frame holds.
+    println("${gpucmd.length(frame)}")
 ```
 
-## Adding it, and checking it
+Build and test with `novo pkg build` and `novo test`. Today `novo test` fails
+on purpose: every test reaches a `not implemented: gpu-nv.<module>.<fn>` panic.
+The tests are the specification the implementation will have to satisfy.
 
-```console
-$ novo pkg add gpu-nv
-$ novo pkg build
-$ novo test --isolate tests/command_tests.nv
+## What the package contains
+
+| Module | Contents |
+| --- | --- |
+| `gpures` | The adapter and its limits, the ten id types, the buffer, texture and sampler descriptions, the row and format arithmetic, the checks against an adapter's limits, and the fault type every call answers with. |
+| `gpucmd` | The fifteen commands, the command list, the nine validation faults, the helpers that record a whole pass or a whole compute round trip, and the arithmetic for how many workgroups a dispatch needs. |
+| `gpushader` | The shader source as a value, the binding layouts, the vertex layouts, the two pipeline descriptions, and the scans that read what a WGSL source declares so a layout can be checked against it. |
+| `gpudriver` | The `GpuDriver` trait, the values its calls answer, and the functions that combine several of its calls into one: open the best device, validate then submit, submit then read back, release in the right order. |
+
+## How to choose an entry point
+
+**`gpucmd` alone is enough to build and check a frame.** Nothing in it needs a
+device, so a test on a machine with no graphics hardware can assert exactly
+what would have been submitted.
+
+**`gpushader.layouts_agree` and `missing_bindings` check a shader against its
+layout.** Both answer before a device exists, which is where a binding
+mismatch is cheapest to find.
+
+**`gpudriver.open_best` is the way in to real hardware.** It lists the
+adapters, picks one and opens a device with its queue and its limits.
+
+**`gpudriver.validate_and_submit` is the ordinary submit.** It checks the list
+against this device's limits first, so a fault is named before the driver
+refuses one.
+
+**`gpudriver.submit_and_read` is a compute round trip in one call.** Submit,
+then read one buffer back.
+
+**`gpures.baseline_limits` is what to check against when no device is open.**
+It answers the limits every backend is required to support, so a build-time
+check has a floor to use.
+
+## The rules a user needs
+
+1. **A command list is decided before it is submitted.** An encoder in other
+   APIs can read a query and choose what to draw next. A list cannot. The
+   answer is two submissions with a readback between them, which costs a round
+   trip. Occlusion queries, timestamps and indirect draws all need the thing a
+   list cannot do.
+2. **A pass is a range in the flat list, not a nested value.**
+   `GpuBeginRenderPass` and `GpuEndPass` are two commands. An unbalanced list
+   is therefore expressible, and `gpucmd.validate` is what makes it a named
+   fault at a position.
+3. **`gpucmd.validate` answers a list of faults, and an empty list means the
+   submission is legal.** It catches a pass with no pipeline set, a command
+   outside a pass, a pass left open, a dispatch past the adapter's workgroup
+   limit, a copy with an unaligned row stride, and unbalanced labels.
+4. **A copy's bytes per row must be a multiple of 256.** WebGPU's
+   `COPY_BYTES_PER_ROW_ALIGNMENT` is 256, and it is the same on Vulkan, Metal
+   and Direct3D 12. A readback with an unaligned stride *succeeds* and the
+   image is sheared, one row further out of place per row, with nothing
+   reported. `gpures.padded_row_bytes` is the stride to use and
+   `GpuBadRowAlignment` is the fault.
+5. **`storage` and `map_read` cannot be set on the same buffer.** A result a
+   compute shader wrote cannot be read by the host without a copy into a second
+   buffer. `gpures.usage_is_legal` is the check, `gpudriver.create_readback_pair`
+   allocates the pair, and `gpucmd.compute_round_trip` records the copy.
+6. **An unbound texture reads as transparent black.** A bind group with a slot
+   unfilled draws nothing, and that looks exactly like a correct draw of
+   nothing. `gpushader.missing_bindings` names the empty slots and
+   `gpushader.layouts_agree` names the disagreements between a layout and what
+   its shader declares.
+7. **`n / workgroup_size` drops the last partial group.** The tail of the data
+   is left untouched, with nothing reported, on exactly the inputs whose length
+   is not a multiple of the size. `gpucmd.workgroups_for` is the ceiling
+   division.
+8. **A vertex buffer's stride must hold its attributes.** A stride that is
+   short by one attribute shears the geometry rather than raising an error.
+   `gpushader.stride_fits` is the check and `gpushader.required_stride` is the
+   number.
+9. **A software rasteriser runs everything, a thousand times slower.** A
+   program that picked one by accident has a benchmark that means nothing.
+   `gpures.is_software` is the question, and `gpures.preferred_adapter` refuses
+   one unless the caller asks for it.
+10. **Limits are per adapter and must be read.** A workgroup size, a bind group
+    count, a buffer size and a texture dimension are all numbers a program
+    silently exceeds on the smaller of two machines. `gpures.fits_limits` and
+    `texture_fits_limits` make the check before the allocation rather than
+    after the failure.
+11. **A device can be lost, and the type says so.** Every driver call answers a
+    `Result`, and `GpuDeviceLost` is a variant rather than a panic. A laptop
+    that suspends, a driver that updates and a shader that hangs the GPU all
+    produce it. `gpudriver.needs_recreate` says whether every resource has to
+    be made again.
+12. **Resources are released in an order the backend requires.**
+    `gpudriver.release_all` applies it and `gpures` — through
+    `gpudriver.release_rank` — is where the order is written down.
+13. **The WGSL source is the caller's and this package does not compile it.**
+    The driver compiles it and the diagnostic comes back whole.
+    `gpushader.bindings_of_wgsl`, `has_entry_point` and `workgroup_size_of`
+    read what a source *declares* and say so when they cannot.
+14. **A pipeline names its entry points as strings.** A typo produces a missing
+    function on some backends and a silently unbound stage on others.
+    `gpudriver.create_checked_shader` checks the names before the driver does.
+15. **`gpures`, `gpucmd` and `gpushader` perform nothing.** Every function in
+    them declares no effects. `gpudriver` declares `[io]`, and `[io, time]` on
+    the four calls that block until the device answers: opening a device,
+    writing a buffer, submitting, and reading back.
+16. **A driver implementation may declare more effects than the trait
+    member.** An implementation over a C library declares `[io, time, ffi]`
+    against an `[io, time]` member, which is legal because a trait with no
+    effect parameter does not pin its implementations' effects.
+
+## What is not included
+
+- **The window, the surface and the swapchain.** This package renders to a
+  texture. Presenting one belongs to a windowing package. An offscreen render
+  is the whole of what a test, a thumbnailer and a headless renderer need, and
+  it is the half with no platform in it.
+- **A C binding.** A binding over a C library is a `sys` package, and this one
+  may not depend on one, which is what keeps a C toolchain from arriving
+  through a dependency. `GpuDriver` is how a binding is reached: a program
+  takes both and supplies the implementation.
+- **A WGSL front end.** The backend has one. A second would disagree with it
+  in the corners, and the disagreement would appear as a shader this package
+  accepts and the driver refuses.
+- **Depth and stencil.** A two-dimensional renderer and a compute dispatch need
+  neither.
+- **Queries, timestamps, occlusion and indirect draws.** All four need a list
+  that can branch on a result. See rule 1.
+- **Linear algebra.** A transform matrix is sixteen floats a caller writes into
+  a uniform buffer, and a driver has no business choosing which package
+  produced them.
+- **A device build.** There is no `tests/embedded_probe.nv` and no claim that
+  any module runs on a microcontroller.
+
+## Related packages
+
+- `std.gpu` in the standard library is the runtime boundary: the foreign
+  function declarations against the native WebGPU library, and the conditional
+  link that keeps a program that does not use the GPU free of it. It stays
+  where it is, because a package outside the `sys` layer may not declare
+  foreign function effects. An implementation of `GpuDriver` over it is how a
+  program uses both, and that implementation is about sixty one-line adapters.
+- [color-nv](https://novo-lang.org/packages/color-nv) is colour as a value. A
+  clear colour and a pixel read back are its `Srgb8`.
+- [raster-nv](https://novo-lang.org/packages/raster-nv) draws shapes into a
+  surface on the CPU. It is the other way to get a picture, and it needs no
+  hardware.
+
+## Tests
+
+```bash
+novo test tests/resource_tests.nv   # the descriptors, the limits, the two silent numbers
+novo test tests/command_tests.nv    # a frame built and validated with no device
+novo test tests/shader_tests.nv     # layouts against shaders, and the driver seam
 ```
 
-The suites are **red on purpose**: every body is a `todo()`, so every
-assertion reaches `not implemented: gpu-nv.<module>.<fn>`.  Twenty-five
-tests across three suites, all red, every failure that message.
+The reference implementation is [wgpu](https://wgpu.rs/), whose API is the
+shape this package follows. The normative document for the limits, the formats
+and the copy alignment is the WebGPU specification, and its required limits
+table is what `gpures.baseline_limits` answers. Asserting 256, 8192 and 4 is
+therefore a check against that table rather than a restatement of this
+package's own code.
 
-`tests/shader_tests.nv` also **implements `GpuDriver`** — a `NoDriver`
-that answers `GpuNoAdapter` to everything — and that is an assertion in
-itself: a trait a test cannot implement in one screen is one a second
+Every assertion in `command_tests.nv` is about a recorded list rather than
+about a device, which is what lets the render half of a program be tested on a
+build machine. `shader_tests.nv` implements `GpuDriver` in about thirty lines
+as a `NoDriver` that answers `GpuNoAdapter` to everything, which is itself an
+assertion: a trait a test cannot implement in one screen is one a second
 backend will not implement either.
 
-## The layer, and the effect row
+The tests compile today and fail at run, each on the
+`not implemented: gpu-nv.<module>.<fn>` panic that is its body. That is the
+expected state of an interface release. They turn green one at a time as
+bodies land. `novo test --isolate tests/<file>` prints one verdict per test.
 
-`host`, from the plan.  `gpures`, `gpucmd` and `gpushader` are `[]`
-throughout; `gpudriver` declares `[io]`, and `[io, time]` where the call
-blocks until the device answers.
+## Implementation status
 
-**Those are the rows `std.gpu` declares, minus `[ffi]`.**  The standard
-library's externs read `[io, ffi]` and `[io, time, ffi]` — the `[time]`
-on exactly the calls that block: opening a device, writing a buffer,
-submitting, reading back.  `[ffi]` is `sys`-only under the layer rules,
-and that is what the trait is for: the C library stays on the shelf
-behind an impl, and a `sys` impl declaring `[io, time, ffi]` against an
-`[io, time]` member is legal, because a trait with no effect parameter
-does not pin its impls' rows.
-
-**The plan row said `[hw]`/`[gpu]`.**  `gpu` is not one of SPEC § 5.1's
-eleven labels, so it cannot be an effect row at all — the same finding
-pty-nv made about `proc`.  And `[hw]` is a claim the standard library
-does not make about these same calls; a hardware abstraction declares
-it, and this is a driver boundary over one.  The rows here are the ones
-the runtime already declares, which is the answer that cannot be wrong
-about what the code does.
-
-## What `std.gpu` keeps, and what this takes
-
-`std.gpu` **stays exactly where it is.**  It is the runtime boundary —
-the `@ffi` shims in `bin/novo_rt_gpu.c` against `libwgpu_native.so`, the
-conditional link that keeps a hello-world free of wgpu, and the
-interpreter's `failwith` arm — and none of that can move into a package,
-because a package may not declare `[ffi]` outside `sys`.  The two
-coexist: a program takes both, and an impl of `GpuDriver` over
-`std.gpu`'s externs is how they meet.  That impl is about sixty
-one-line adapters and belongs beside the runtime rather than here.
-
-| `std.gpu` keeps | this package takes |
+| Item | Implemented |
 | --- | --- |
-| the `@ffi` externs and the `[ffi]` row | nothing: it never names a C library |
-| the conditional link on `novo_gpu_` | nothing |
-| the process-singleton `WGPUInstance` | nothing |
-| raw `Int` handles | `GpuBufferId`, `GpuTextureId`, … as distinct types |
-| `Adapter`, `Device`, `GpuBuffer`, `Texture`, `Pipeline`, `Encoder`, `RenderPass` as thin structs over handles | the same model, as descriptors that can be checked with no device |
-| `novo_gpu_encoder_begin` … `finish_submit` — a mutated encoder | `GpuCommandList`, a value |
-| three prebuilt pipeline shapes (`quad`, `quad_mvp`, `instanced_quad`) | `GpuRenderPipelineDesc` with an explicit vertex layout, so a fourth shape is a value and not a new extern |
-| `ptr.alloc_word` out-parameters for the layouts a pipeline creates | `GpuOpenDevice` and `GpuTextureView`, which answer the pair |
-| the 256-byte row alignment, in a comment | `gpures.padded_row_bytes`, and `GpuBadRowAlignment` |
-
-**Window, surface and present stay out of both.**  `std.gpu`'s own
-documentation already draws that line and this package keeps it: this
-renders to a texture, and presenting one is `std.window`'s. An
-offscreen render is the whole of what a test, a thumbnailer and a
-headless renderer need, and it is the half with no platform in it.
-
-## What ml's device dispatch would take, and what it would not
-
-`orbit/ml` selects a backend with **a runtime device tag rather than a
-trait**, and its own header says why: one process can hold handles from
-two vendors at once, and a per-type impl would still have to carry the
-tag.  That is a real disagreement with this package's shape, and it is
-worth being exact about where it lands.
-
-**What ml would take**: the values.  `GpuBufferId` and `GpuCommandList`
-are exactly what its quantized weights and its matvec dispatch already
-are — opaque device blobs behind handles, and a sequence of kernels to
-run — and a recorded list is what lets it build a layer's work on the
-CPU and submit it once.  `gpucmd.workgroups_for` is the ceiling division
-its kernels need, and `gpures.GpuLimits.max_compute_workgroup_size_x` is
-the wavefront-width hazard its README describes, read from the adapter
-instead of derived from a build script.
-
-**What it would not take**: `GpuDriver` as a `dyn`.  ml binds one device
-per process and dispatches on a tag; taking the trait would mean either
-one impl per vendor chosen at startup — which is what it already does,
-spelled differently — or a `dyn` whose effect union every ml call pays.
-Its CUDA and ROCm kernels are also not WGSL, and a WGSL-only shader
-surface has nothing to say about them.
-
-So the honest answer is: **ml would take the value half and leave the
-trait.**  That is a report for the milestone review rather than a
-redesign here, and it is the one consumer whose shape this package does
-not fit.
-
-## Where the design wanted to widen
-
-**`trait GpuDriver[e]` would make two thirds of this package `core`.**
-Every function in `gpudriver` is a pump over a trait: `open_best`,
-`validate_and_submit`, `submit_and_read` and the rest perform nothing of
-their own, and with the effect-parameterised form — btree-nv's `PageIo`
-shape, `docs/publishing.md` § How a `core` package takes a stream from
-its host — each would be charged what the caller's impl costs and this
-package would have no effects at all.
-
-It is not done here because the plan row says `host` and because the
-concrete form is what the standard library's rows already look like.  It
-is the same widening postgres-nv and mysql-nv named on `std.sql`'s
-`Database`: three rows now want an effect parameter on a trait whose
-impls differ in what they cost.
-
-## Five places the GPU bites, and where each one has a name
-
-- **A row stride that is not a multiple of 256.**  The readback
-  SUCCEEDS and the image is sheared, one row further out of place per
-  row, with no error attached.  `gpures.padded_row_bytes`, and
-  `GpuBadRowAlignment` as a validation fault.
-- **`Storage` and `MapRead` are mutually exclusive.**  A result a
-  compute shader wrote cannot be read by the host without a copy step,
-  and a program that tried gets a driver error about a buffer rather
-  than about the rule.  `gpures.usage_is_legal`,
-  `gpucmd.compute_round_trip`, `gpudriver.create_readback_pair`.
-- **An unbound texture reads as transparent black.**  So a bind group
-  with a slot unfilled draws nothing and looks exactly like a correct
-  draw of nothing.  `gpushader.missing_bindings`, and
-  `gpushader.layouts_agree` for the layout that disagrees with its
-  shader.
-- **`n / workgroup_size` drops the last partial group.**  The tail of
-  the data is untouched, with no error, on exactly the inputs whose
-  length is not a multiple of the size.  `gpucmd.workgroups_for`.
-- **A vertex stride that does not hold its attributes.**  Wrong by four
-  in every renderer that has added an attribute and forgotten it, and
-  the symptom is geometry that shears rather than an error.
-  `gpushader.stride_fits`.
-
-And a sixth that is not a bug but a lie: **a software rasteriser runs
-everything**, a thousand times slower, and a program that silently used
-one has a benchmark that means nothing and a user who thinks their
-machine is broken.  `gpures.is_software`, and `preferred_adapter`
-refuses one unless asked.
-
-## What is deliberately absent
-
-- **The window, the surface and the swapchain.**  `std.window`'s, and
-  the line `std.gpu` already draws.
-- **A C binding.**  `libvulkan-sys` and the rest are `sys` and a `host`
-  package may not depend on one — which is the rule that keeps a C
-  toolchain from arriving through a dependency.  The trait is how one is
-  reached.
-- **Depth and stencil.**  A 2D renderer and a compute dispatch need
-  neither, and a depth attachment is a row for the version that has a
-  3D consumer.
-- **Queries, timestamps and occlusion.**  All three need a list that can
-  branch on a result, which is the trade-off named above.
-- **Indirect draws.**  The same reason.
-- **A WGSL front end.**  The backend has one; a second would disagree
-  with it in the corners, and the disagreement would show up as a shader
-  this package accepts and the driver refuses.  The scans here read what
-  a source DECLARES and say so when they cannot.
-
-## Reference
-
-wgpu is the reference implementation and its API is the shape this
-ports; WebGPU's specification is the normative document for the limits,
-the formats and the 256-byte copy alignment, and its "required limits"
-table is what `gpures.baseline_limits` answers.  `std.gpu` and
-`bin/novo_rt_gpu.c` are the existing binding this package is measured
-against, and `docs/stdlib/gpu.md` is the surface it keeps compatible in
-behaviour if not in spelling.
-
-The implementation lane's gate is a real adapter: an offscreen render
-with pixel-asserted readback, a compute round trip, and the same two on
-a software rasteriser so CI can run them.
+| `gpures.GpuBackend`, `.GpuAdapterKind`, `.GpuAdapterInfo`, `.GpuLimits`, `.GpuFault` | the types are declared; nothing constructs one |
+| `gpures.GpuDeviceId`, `.GpuQueueId`, `.GpuBufferId`, `.GpuTextureId`, `.GpuViewId` | the types are declared |
+| `gpures.GpuSamplerId`, `.GpuShaderId`, `.GpuPipelineId`, `.GpuLayoutId`, `.GpuBindGroupId` | the types are declared |
+| `gpures.GpuBufferUsage`, `.GpuBufferDesc`, `.GpuTextureFormat`, `.GpuTextureDesc`, `.GpuSamplerDesc` | the types are declared |
+| `gpures.no_usage`, `.storage_usage`, `.read_usage`, `.usage_is_legal` | no |
+| `gpures.buffer`, `.texture_2d`, `.sampler_nearest_clamp` | no |
+| `gpures.row_bytes`, `.padded_row_bytes`, `.format_bytes` | no |
+| `gpures.fits_limits`, `.texture_fits_limits`, `.baseline_limits` | no |
+| `gpures.is_software`, `.preferred_adapter`, `.backend_name` | no |
+| `gpucmd.GpuCommand`, `.GpuCommandList`, `.GpuListFault`, `.GpuWorkCount` | the types are declared; nothing constructs one |
+| `gpucmd.list`, `.push`, `.extend`, `.length`, `.uses_buffer`, `.work_count` | no |
+| `gpucmd.validate` | no |
+| `gpucmd.render_pass`, `.compute_pass`, `.compute_round_trip`, `.workgroups_for` | no |
+| `gpushader.GpuShaderDesc`, `.GpuStages`, `.GpuBindingKind`, `.GpuBindingDesc`, `.GpuLayoutDesc` | the types are declared; nothing constructs one |
+| `gpushader.GpuBindingValue`, `.GpuBindingSlot`, `.GpuBindGroupDesc`, `.GpuWorkgroupSize` | the types are declared |
+| `gpushader.GpuVertexAttribute`, `.GpuVertexBufferDesc`, `.GpuRenderPipelineDesc`, `.GpuComputePipelineDesc` | the types are declared |
+| `gpushader.shader`, `.stages`, `.layout`, `.sampler_texture_layout` | no |
+| `gpushader.bindings_of_wgsl`, `.layouts_agree`, `.has_entry_point`, `.workgroup_size_of` | no |
+| `gpushader.vertex_buffer`, `.attribute`, `.stride_fits`, `.required_stride` | no |
+| `gpushader.render_pipeline`, `.compute_pipeline`, `.bind_group`, `.missing_bindings` | no |
+| `gpudriver.GpuDriver`, and all thirteen of its members | the trait is declared; no implementation is shipped |
+| `gpudriver.GpuOpenDevice`, `.GpuTextureView`, `.GpuSubmission`, `.GpuResource`, `.GpuReadbackPair` | the types are declared |
+| `gpudriver.open_best`, `.validate_and_submit`, `.submit_and_read` | no |
+| `gpudriver.create_checked_shader`, `.create_readback_pair` | no |
+| `gpudriver.release_all`, `.release_rank`, `.needs_recreate` | no |
 
 ## Licence
 
-Apache-2.0.
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->
