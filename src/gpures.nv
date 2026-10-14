@@ -1,8 +1,6 @@
 // gpures.nv — the adapter, the device and the four things a program
 // allocates, as values.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A RESOURCE IS A NAME AND NOT THE THING.  `GpuBufferId`,
 // `GpuTextureId`, `GpuShaderId` and the rest are ids the DRIVER
 // allocated: the memory lives on the other side of the boundary, this
@@ -229,7 +227,15 @@ pub enum GpuFault
 impl Error for GpuFault
     // One line: what was asked for, and what the driver said.
     fn message(self) -> Str
-        todo("gpu-nv.gpures.GpuFault.message")
+        match self
+            GpuNoAdapter                                 => "gpu-nv: no adapter this backend can see"
+            GpuDeviceLost(reason)                        => "gpu-nv: the device was lost: ${reason}"
+            GpuOverLimit(limit, asked, allowed)          => "gpu-nv: ${limit} is ${asked} and the adapter allows ${allowed}"
+            GpuBadUsage(detail)                          => "gpu-nv: the backend refuses this usage: ${detail}"
+            GpuShaderFailed(message)                     => "gpu-nv: the shader did not compile: ${message}"
+            GpuBadCommandList(detail)                    => "gpu-nv: the command list is not a legal submission: ${detail}"
+            GpuBadRowAlignment(bytes_per_row, alignment) => "gpu-nv: a row stride of ${bytes_per_row} is not a multiple of ${alignment}"
+            GpuDriverError(code, message)                => "gpu-nv: the driver answered ${code}: ${message}"
 
 // A buffer usage set with nothing in it.
 //
@@ -247,7 +253,15 @@ impl Error for GpuFault
 //     println("a buffer that may be used for nothing")
 // ```
 pub fn no_usage() -> GpuBufferUsage []
-    todo("gpu-nv.gpures.no_usage")
+    GpuBufferUsage {
+        copy_src: false,
+        copy_dst: false,
+        storage: false,
+        uniform: false,
+        vertex: false,
+        index: false,
+        map_read: false,
+        map_write: false }
 
 // The usage a compute shader's working buffer needs.
 //
@@ -265,7 +279,15 @@ pub fn no_usage() -> GpuBufferUsage []
 //     println("what a compute buffer is for")
 // ```
 pub fn storage_usage() -> GpuBufferUsage []
-    todo("gpu-nv.gpures.storage_usage")
+    GpuBufferUsage {
+        copy_src: true,
+        copy_dst: true,
+        storage: true,
+        uniform: false,
+        vertex: false,
+        index: false,
+        map_read: false,
+        map_write: false }
 
 // The usage a host readback buffer needs.
 //
@@ -283,7 +305,15 @@ pub fn storage_usage() -> GpuBufferUsage []
 //     println("what the host can read")
 // ```
 pub fn read_usage() -> GpuBufferUsage []
-    todo("gpu-nv.gpures.read_usage")
+    GpuBufferUsage {
+        copy_src: false,
+        copy_dst: true,
+        storage: false,
+        uniform: false,
+        vertex: false,
+        index: false,
+        map_read: true,
+        map_write: false }
 
 // Is this usage set one a backend will accept?
 //
@@ -301,7 +331,7 @@ pub fn read_usage() -> GpuBufferUsage []
 //     println("whether a buffer usage is one a backend allows")
 // ```
 pub fn usage_is_legal(u: GpuBufferUsage) -> Bool []
-    todo("gpu-nv.gpures.usage_is_legal")
+    not (u.storage and u.map_read)
 
 // A buffer descriptor.
 //
@@ -315,7 +345,7 @@ pub fn usage_is_legal(u: GpuBufferUsage) -> Bool []
 //     println("a buffer, described")
 // ```
 pub fn buffer(label: Str, size_bytes: Int, usage: GpuBufferUsage) -> GpuBufferDesc []
-    todo("gpu-nv.gpures.buffer")
+    GpuBufferDesc { label: label, size_bytes: size_bytes, usage: usage }
 
 // A 2D texture descriptor that can be both rendered to and sampled
 // from.
@@ -335,7 +365,17 @@ pub fn buffer(label: Str, size_bytes: Int, usage: GpuBufferUsage) -> GpuBufferDe
 // ```
 pub fn texture_2d(label: Str, width: Int, height: Int,
                   format: GpuTextureFormat) -> GpuTextureDesc []
-    todo("gpu-nv.gpures.texture_2d")
+    // `copy_dst` as well as `copy_src`: the texture a test renders into
+    // is usually the one it fills from host bytes first.
+    GpuTextureDesc {
+        label: label,
+        width: width,
+        height: height,
+        format: format,
+        texture_binding: true,
+        render_attachment: true,
+        copy_src: true,
+        copy_dst: true }
 
 // A sampler descriptor with nearest filtering and clamped addressing.
 //
@@ -349,7 +389,7 @@ pub fn texture_2d(label: Str, width: Int, height: Int,
 //     println("the sampler a glyph atlas wants")
 // ```
 pub fn sampler_nearest_clamp(label: Str) -> GpuSamplerDesc []
-    todo("gpu-nv.gpures.sampler_nearest_clamp")
+    GpuSamplerDesc { label: label, nearest: true, clamp: true }
 
 // How many bytes one row of this texture occupies.
 //
@@ -365,7 +405,7 @@ pub fn sampler_nearest_clamp(label: Str) -> GpuSamplerDesc []
 //     println("${gpures.row_bytes(GpuRgba8Unorm, 64)}")
 // ```
 pub fn row_bytes(format: GpuTextureFormat, width: Int) -> Int []
-    todo("gpu-nv.gpures.row_bytes")
+    format_bytes(format) * width
 
 // The row stride a copy must use: the row bytes, rounded up to the
 // alignment.
@@ -382,7 +422,19 @@ pub fn row_bytes(format: GpuTextureFormat, width: Int) -> Int []
 //     println("${gpures.padded_row_bytes(GpuRgba8Unorm, 65, 256)}")
 // ```
 pub fn padded_row_bytes(format: GpuTextureFormat, width: Int, alignment: Int) -> Int []
-    todo("gpu-nv.gpures.padded_row_bytes")
+    // An alignment of zero or less is no alignment to round to, and the
+    // unpadded row is then the only answer that is not a division by
+    // zero.  A caller that got an alignment from a driver never passes
+    // one.
+    let row = row_bytes(format, width)
+    if alignment <= 0
+        row
+    else
+        let remainder = row % alignment
+        if remainder == 0
+            row
+        else
+            row + alignment - remainder
 
 // How many bytes a pixel of this format takes.
 //
@@ -393,7 +445,16 @@ pub fn padded_row_bytes(format: GpuTextureFormat, width: Int, alignment: Int) ->
 //     println("${gpures.format_bytes(GpuRgba32Float)}")
 // ```
 pub fn format_bytes(format: GpuTextureFormat) -> Int []
-    todo("gpu-nv.gpures.format_bytes")
+    // An unrecognised format answers 0, which is this package saying it
+    // does not know rather than a size: a compressed or depth format's
+    // bytes per pixel is the driver's to report, and 0 makes the row
+    // arithmetic visibly wrong instead of plausibly wrong.
+    match format
+        GpuRgba8Unorm     => 4
+        GpuRgba8UnormSrgb => 4
+        GpuBgra8Unorm     => 4
+        GpuRgba32Float    => 16
+        GpuFormatOther(_) => 0
 
 // Does this buffer descriptor fit the adapter's limits?
 //
@@ -413,7 +474,11 @@ pub fn format_bytes(format: GpuTextureFormat) -> Int []
 //     println("whether a buffer fits this adapter")
 // ```
 pub fn fits_limits(d: GpuBufferDesc, l: GpuLimits) -> ?GpuFault []
-    todo("gpu-nv.gpures.fits_limits")
+    if d.size_bytes > l.max_buffer_bytes
+        Some(GpuOverLimit(limit: "max_buffer_bytes", asked: d.size_bytes,
+                          allowed: l.max_buffer_bytes))
+    else
+        None
 
 // Does this texture descriptor fit?
 //
@@ -429,7 +494,14 @@ pub fn fits_limits(d: GpuBufferDesc, l: GpuLimits) -> ?GpuFault []
 //     println("whether a texture fits this adapter")
 // ```
 pub fn texture_fits_limits(d: GpuTextureDesc, l: GpuLimits) -> ?GpuFault []
-    todo("gpu-nv.gpures.texture_fits_limits")
+    if d.width > l.max_texture_dimension_2d
+        Some(GpuOverLimit(limit: "max_texture_dimension_2d", asked: d.width,
+                          allowed: l.max_texture_dimension_2d))
+    elif d.height > l.max_texture_dimension_2d
+        Some(GpuOverLimit(limit: "max_texture_dimension_2d", asked: d.height,
+                          allowed: l.max_texture_dimension_2d))
+    else
+        None
 
 // The limits every backend is required to support.
 //
@@ -444,7 +516,20 @@ pub fn texture_fits_limits(d: GpuTextureDesc, l: GpuLimits) -> ?GpuFault []
 //     println("${gpures.baseline_limits().max_bind_groups}")
 // ```
 pub fn baseline_limits() -> GpuLimits []
-    todo("gpu-nv.gpures.baseline_limits")
+    // Every number is from the WebGPU specification's required limits,
+    // which is the floor each backend is required to meet.
+    GpuLimits {
+        max_buffer_bytes: 268435456,
+        max_texture_dimension_2d: 8192,
+        max_bind_groups: 4,
+        max_bindings_per_bind_group: 1000,
+        max_vertex_buffers: 8,
+        max_compute_workgroup_size_x: 256,
+        max_compute_workgroup_size_y: 256,
+        max_compute_workgroup_size_z: 64,
+        max_compute_invocations_per_workgroup: 256,
+        max_compute_workgroups_per_dimension: 65535,
+        copy_bytes_per_row_alignment: 256 }
 
 // Is this adapter one a program should refuse?
 //
@@ -463,7 +548,21 @@ pub fn baseline_limits() -> GpuLimits []
 //     println("whether an adapter is a software rasteriser")
 // ```
 pub fn is_software(a: GpuAdapterInfo) -> Bool []
-    todo("gpu-nv.gpures.is_software")
+    // Either field can carry the fact: `backend` is where a driver that
+    // knows it is llvmpipe says so, and `kind` is where one that only
+    // knows it has no GPU says so.
+    a.kind == GpuCpu or a.backend == GpuSoftware
+
+// Where an adapter kind sits in the preference order: lower is better.
+//
+// A software rasteriser has no rank: `preferred_adapter` removes it
+// before this is asked, unless the caller asked for one.
+fn adapter_rank(k: GpuAdapterKind) -> Int
+    match k
+        GpuDiscrete   => 0
+        GpuIntegrated => 1
+        GpuCpu        => 2
+        GpuVirtual    => 3
 
 // The best adapter out of a list, by a simple rule.
 //
@@ -484,7 +583,19 @@ pub fn is_software(a: GpuAdapterInfo) -> Bool []
 //     println("the adapter a program should pick")
 // ```
 pub fn preferred_adapter(all: [GpuAdapterInfo], allow_software: Bool) -> ?GpuAdapterInfo []
-    todo("gpu-nv.gpures.preferred_adapter")
+    // A software rasteriser is the one this rule refuses, and refusing
+    // it here rather than at the end of the comparison is what makes
+    // `None` mean "a real adapter, or none" when the caller did not ask
+    // for one.
+    let usable = list.filter(all, a => allow_software or not is_software(a))
+    if list.len(usable) == 0
+        None
+    else
+        // `list.find` answers the first of equals, which is the rest of
+        // the rule: the lowest rank wins, and a tie goes to the earlier.
+        let ranks = list.map(usable, a => adapter_rank(a.kind))
+        let lowest = list.min(ranks)!
+        list.find(usable, a => adapter_rank(a.kind) == lowest)
 
 // The backend's name, as a person would write it.
 //
@@ -495,4 +606,9 @@ pub fn preferred_adapter(all: [GpuAdapterInfo], allow_software: Bool) -> ?GpuAda
 //     println(gpures.backend_name(GpuVulkan))
 // ```
 pub fn backend_name(b: GpuBackend) -> Str []
-    todo("gpu-nv.gpures.backend_name")
+    match b
+        GpuVulkan     => "Vulkan"
+        GpuMetal      => "Metal"
+        GpuDirect3d12 => "Direct3D 12"
+        GpuWebGpu     => "WebGPU"
+        GpuSoftware   => "software"

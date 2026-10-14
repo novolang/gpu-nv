@@ -1,9 +1,6 @@
 // shader_tests.nv — the layout against the shader, and the driver seam
 // implemented in thirty lines.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: gpu-nv.<module>.<fn>`.
-//
 // THE SECOND HALF OF THIS FILE IMPLEMENTS `GpuDriver`.  That is an
 // assertion in itself: the seam is meant to be small enough that a test
 // double, a shelf binding over a C library and the standard library's
@@ -47,7 +44,7 @@ fn test_an_entry_point_typo_is_caught_before_a_driver_sees_it() [io]
     test.assert(gpushader.has_entry_point(a_shader_source(), "fs_main"))
 
     test.case("and one that is not is not")
-    test.assert(gpushader.has_entry_point(a_shader_source(), "vs_mian") == false)
+    test.assert(not gpushader.has_entry_point(a_shader_source(), "vs_mian"))
 
 @test
 fn test_a_dispatch_divides_by_the_size_the_shader_declares() [io]
@@ -110,7 +107,7 @@ fn test_a_vertex_stride_that_does_not_hold_its_attributes_is_caught() [io]
     test.assert(gpushader.stride_fits(gpushader.vertex_buffer(16, false, [position, uv])))
 
     test.case("and one of twelve does not")
-    test.assert(gpushader.stride_fits(gpushader.vertex_buffer(12, false, [position, uv])) == false)
+    test.assert(not gpushader.stride_fits(gpushader.vertex_buffer(12, false, [position, uv])))
 
     test.case("a per-instance buffer is the same arithmetic")
     test.assert(gpushader.stride_fits(gpushader.vertex_buffer(8, true,
@@ -272,4 +269,4 @@ fn test_a_lost_device_is_a_different_recovery_from_a_refused_submission() [io]
     test.assert(gpudriver.needs_recreate(GpuDeviceLost(reason: "suspended")))
 
     test.case("and a shader that would not compile does not")
-    test.assert(gpudriver.needs_recreate(GpuShaderFailed(message: "line 3")) == false)
+    test.assert(not gpudriver.needs_recreate(GpuShaderFailed(message: "line 3")))

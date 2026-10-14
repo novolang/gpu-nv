@@ -1,20 +1,21 @@
 [package]
 name        = "gpu-nv"
 license     = "Apache-2.0"
-version     = "0.0.2"
-description = "std.gpu as a package: adapters, devices, buffers, textures, pipelines and bind groups as values, WGSL the caller supplies, a frame recorded as a command list a host submits, and the driver as a trait a shelf binding or the standard library's own runtime implements.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "std.gpu as a package: adapters, devices, buffers, textures, pipelines and bind groups as values, WGSL the caller supplies, a frame recorded as a command list a host submits, and the driver as a trait a shelf binding or the standard library's own runtime implements."
 
 # `license` sits immediately after the name, before any value that could
 # contain a square bracket.  The publish reads it with a pattern that
 # stops at the first `[`, so a description naming an effect row hides it
 # and the release records no licence at all — silently.
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# EXPERIMENTAL, not stable.  The shapes are settled and the suite is
+# green, but nothing here has been run against a real GPU by this
+# package's own tests — the one thing that talks to hardware is
+# `gpudriver.GpuDriver`, and the evidence for it is a driver double.
+# A release that claimed more would be claiming the backends' behaviour
+# for them.
+stability   = "experimental"
 
 # `host`, from the plan, and the split inside it is the design.
 #
@@ -44,7 +45,7 @@ category    = "graphics"
 tags        = ["gpu", "wgpu", "webgpu", "compute", "render", "wgsl", "graphics"]
 repository  = "https://github.com/novolang/gpu-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.20.2"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

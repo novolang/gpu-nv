@@ -1,7 +1,5 @@
 // gpucmd.nv — the work, as a list a host submits.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE LOAD-BEARING INTERFACE OF THIS PACKAGE IS `GpuCommand`, AND WHAT
 // IT CARRIES IS THAT RECORDING AND SUBMITTING ARE DIFFERENT ACTS.
 // Every graphics API models a frame as an encoder a caller mutates —
@@ -39,6 +37,8 @@
 //
 // NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
 
+use std.bytes
+use std.list
 use gpures
 
 // One recorded command.
@@ -119,7 +119,16 @@ pub enum GpuListFault
 impl Error for GpuListFault
     // One line: which command, by position, and what was wrong.
     fn message(self) -> Str
-        todo("gpu-nv.gpucmd.GpuListFault.message")
+        match self
+            GpuOutsidePass(at)                             => "gpu-nv: command ${at} is outside any pass"
+            GpuPassAlreadyOpen(at)                         => "gpu-nv: command ${at} begins a pass while another is open"
+            GpuNoPassOpen(at)                              => "gpu-nv: command ${at} ends a pass and none is open"
+            GpuPassNotEnded(at)                            => "gpu-nv: the pass that begins at command ${at} is never ended"
+            GpuNoPipeline(at)                              => "gpu-nv: command ${at} draws or dispatches with no pipeline set in this pass"
+            GpuWrongPassKind(at, command)                  => "gpu-nv: command ${at} is ${command} in the wrong kind of pass"
+            GpuDispatchTooLarge(at, axis, asked, allowed)  => "gpu-nv: command ${at} dispatches ${asked} workgroups on ${axis} and the adapter allows ${allowed}"
+            GpuUnalignedCopy(at, bytes_per_row, alignment) => "gpu-nv: command ${at} copies with a row stride of ${bytes_per_row}, which is not a multiple of ${alignment}"
+            GpuUnbalancedLabels(at)                        => "gpu-nv: the debug label at command ${at} has no matching pop"
 
 // An empty list.
 //
@@ -133,7 +142,7 @@ impl Error for GpuListFault
 //     println("a frame with nothing in it yet")
 // ```
 pub fn list(label: Str) -> GpuCommandList []
-    todo("gpu-nv.gpucmd.list")
+    GpuCommandList { label: label, commands: [] }
 
 // The list with one more command on the end.
 //
@@ -151,7 +160,11 @@ pub fn list(label: Str) -> GpuCommandList []
 //     println("one more command")
 // ```
 pub fn push(l: GpuCommandList, c: GpuCommand) -> GpuCommandList []
-    todo("gpu-nv.gpucmd.push")
+    // `list.concat` and not `list.push`: a list is a reference, so
+    // pushing into `l.commands` would be seen by every name that holds
+    // the list the caller passed in.
+    let commands = list.concat(l.commands, [c])
+    GpuCommandList { label: l.label, commands: commands }
 
 // The list with several more commands on the end.
 //
@@ -165,7 +178,8 @@ pub fn push(l: GpuCommandList, c: GpuCommand) -> GpuCommandList []
 //     println("a batch of commands")
 // ```
 pub fn extend(l: GpuCommandList, cs: [GpuCommand]) -> GpuCommandList []
-    todo("gpu-nv.gpucmd.extend")
+    let commands = list.concat(l.commands, cs)
+    GpuCommandList { label: l.label, commands: commands }
 
 // How many commands a list holds.
 //
@@ -176,7 +190,26 @@ pub fn extend(l: GpuCommandList, cs: [GpuCommand]) -> GpuCommandList []
 //     println("${gpucmd.length(gpucmd.list("frame"))}")
 // ```
 pub fn length(l: GpuCommandList) -> Int []
-    todo("gpu-nv.gpucmd.length")
+    list.len(l.commands)
+
+// Which axis of a dispatch is past the adapter's workgroup limit, if
+// any.
+//
+// The first axis over, because a fault names one axis and a caller
+// fixing x and then y and then z should not need three of them.  The
+// limit is on workgroups and not on invocations: it is how many
+// workgroups may be dispatched along one axis, which is why
+// `limits.max_compute_workgroups_per_dimension` is the number here and
+// not a workgroup size.
+fn dispatch_limit_fault(at: Int, x: Int, y: Int, z: Int, allowed: Int) -> ?GpuListFault
+    if x > allowed
+        Some(GpuDispatchTooLarge(at: at, axis: "x", asked: x, allowed: allowed))
+    elif y > allowed
+        Some(GpuDispatchTooLarge(at: at, axis: "y", asked: y, allowed: allowed))
+    elif z > allowed
+        Some(GpuDispatchTooLarge(at: at, axis: "z", asked: z, allowed: allowed))
+    else
+        None
 
 // Is this a submission a driver will accept?
 //
@@ -199,7 +232,100 @@ pub fn length(l: GpuCommandList) -> Int []
 //     println("whether a frame is a legal submission")
 // ```
 pub fn validate(l: GpuCommandList, limits: GpuLimits) -> [GpuListFault] []
-    todo("gpu-nv.gpucmd.validate")
+    // The whole of it is a walk with four pieces of state: which pass is
+    // open and at what position, whether a pipeline has been set since
+    // it opened, and how deep the debug labels are.
+    var faults: [GpuListFault] = []
+    var open_at = -1
+    var in_compute = false
+    var has_pipeline = false
+    var label_at = -1
+    var labels = 0
+    var at = 0
+    for c in l.commands
+        match c
+            GpuBeginRenderPass(_, _, _, _, _)                 =>
+                if open_at >= 0
+                    faults = list.push(faults, GpuPassAlreadyOpen(at: at))
+                else
+                    open_at = at
+                    in_compute = false
+                    has_pipeline = false
+            GpuBeginRenderPassLoad(_)                         =>
+                if open_at >= 0
+                    faults = list.push(faults, GpuPassAlreadyOpen(at: at))
+                else
+                    open_at = at
+                    in_compute = false
+                    has_pipeline = false
+            GpuBeginComputePass                               =>
+                if open_at >= 0
+                    faults = list.push(faults, GpuPassAlreadyOpen(at: at))
+                else
+                    open_at = at
+                    in_compute = true
+                    has_pipeline = false
+            GpuEndPass                                        =>
+                if open_at < 0
+                    faults = list.push(faults, GpuNoPassOpen(at: at))
+                else
+                    open_at = -1
+                    in_compute = false
+                    has_pipeline = false
+            GpuSetPipeline(_)                                 =>
+                if open_at < 0
+                    faults = list.push(faults, GpuOutsidePass(at: at))
+                else
+                    has_pipeline = true
+            GpuSetBindGroup(_, _)                             =>
+                if open_at < 0
+                    faults = list.push(faults, GpuOutsidePass(at: at))
+            GpuSetVertexBuffer(_, _, _, _)                    =>
+                if open_at < 0
+                    faults = list.push(faults, GpuOutsidePass(at: at))
+            GpuDraw(_, _)                                     =>
+                if open_at < 0
+                    faults = list.push(faults, GpuOutsidePass(at: at))
+                elif in_compute
+                    faults = list.push(faults, GpuWrongPassKind(at: at, command: "a draw"))
+                elif not has_pipeline
+                    faults = list.push(faults, GpuNoPipeline(at: at))
+            GpuDispatch(x, y, z)                              =>
+                if open_at < 0
+                    faults = list.push(faults, GpuOutsidePass(at: at))
+                elif not in_compute
+                    faults = list.push(faults, GpuWrongPassKind(at: at, command: "a dispatch"))
+                elif not has_pipeline
+                    faults = list.push(faults, GpuNoPipeline(at: at))
+                else
+                    let allowed = limits.max_compute_workgroups_per_dimension
+                    let over = dispatch_limit_fault(at, x, y, z, allowed)
+                    if let Some(f) = over
+                        faults = list.push(faults, f)
+            GpuCopyTextureToBuffer(_, _, _, _, bytes_per_row) =>
+                // Outside a pass is where this one belongs: a copy is a
+                // queue operation and not a pass command.
+                let alignment = limits.copy_bytes_per_row_alignment
+                if alignment > 0 and (bytes_per_row <= 0 or bytes_per_row % alignment != 0)
+                    faults = list.push(faults, GpuUnalignedCopy(at: at,
+                                                              bytes_per_row: bytes_per_row,
+                                                              alignment: alignment))
+            GpuPushLabel(_)                                   =>
+                if labels == 0
+                    label_at = at
+                labels += 1
+            GpuPopLabel                                       =>
+                if labels == 0
+                    faults = list.push(faults, GpuUnbalancedLabels(at: at))
+                else
+                    labels -= 1
+            _                                                 => ()
+        at += 1
+    if open_at >= 0
+        faults = list.push(faults, GpuPassNotEnded(at: open_at))
+    if labels > 0
+        faults = list.push(faults, GpuUnbalancedLabels(at: label_at))
+    faults
 
 // A render pass that clears, as the two commands it is.
 //
@@ -218,7 +344,9 @@ pub fn validate(l: GpuCommandList, limits: GpuLimits) -> [GpuListFault] []
 // ```
 pub fn render_pass(target: GpuViewId, r: Float, g: Float, b: Float, a: Float,
                    inner: [GpuCommand]) -> [GpuCommand] []
-    todo("gpu-nv.gpucmd.render_pass")
+    let opened = list.concat([GpuBeginRenderPass(target: target, r: r, g: g, b: b, a: a)],
+                             inner)
+    list.concat(opened, [GpuEndPass])
 
 // A compute pass, the same way.
 //
@@ -232,7 +360,8 @@ pub fn render_pass(target: GpuViewId, r: Float, g: Float, b: Float, a: Float,
 //     println("a compute pass that cannot be left open")
 // ```
 pub fn compute_pass(inner: [GpuCommand]) -> [GpuCommand] []
-    todo("gpu-nv.gpucmd.compute_pass")
+    let opened = list.concat([GpuBeginComputePass], inner)
+    list.concat(opened, [GpuEndPass])
 
 // The whole of a compute round trip, as one list.
 //
@@ -255,7 +384,16 @@ pub fn compute_pass(inner: [GpuCommand]) -> [GpuCommand] []
 // ```
 pub fn compute_round_trip(pipeline: GpuPipelineId, group: GpuBindGroupId, input: GpuBufferId,
                           readback: GpuBufferId, data: Bytes, groups_x: Int) -> GpuCommandList []
-    todo("gpu-nv.gpucmd.compute_round_trip")
+    let commands = [
+        GpuWriteBuffer(buffer: input, offset_bytes: 0, data: data),
+        GpuBeginComputePass,
+        GpuSetPipeline(pipeline: pipeline),
+        GpuSetBindGroup(slot: 0, group: group),
+        GpuDispatch(x: groups_x, y: 1, z: 1),
+        GpuEndPass,
+        GpuCopyBuffer(src: input, src_offset: 0, dst: readback, dst_offset: 0,
+                      size_bytes: bytes.len(data))]
+    GpuCommandList { label: "compute", commands: commands }
 
 // How many workgroups a dispatch needs to cover this many items.
 //
@@ -271,7 +409,25 @@ pub fn compute_round_trip(pipeline: GpuPipelineId, group: GpuBindGroupId, input:
 //     println("${gpucmd.workgroups_for(1000, 64)}")
 // ```
 pub fn workgroups_for(items: Int, workgroup_size: Int) -> Int []
-    todo("gpu-nv.gpucmd.workgroups_for")
+    // Nothing to cover, or nothing to cover it with, is no workgroups
+    // rather than a division by zero.
+    if items <= 0 or workgroup_size <= 0
+        0
+    else
+        (items + workgroup_size - 1) / workgroup_size
+
+// Does one command name this buffer?
+//
+// Every command that carries a `GpuBufferId`: the two that write into
+// one, the vertex binding, the buffer copy on either side, and the
+// destination of a texture readback.
+fn command_uses_buffer(c: GpuCommand, b: GpuBufferId) -> Bool
+    match c
+        GpuSetVertexBuffer(_, buffer, _, _)     => buffer == b
+        GpuWriteBuffer(buffer, _, _)            => buffer == b
+        GpuCopyBuffer(src, _, dst, _, _)        => src == b or dst == b
+        GpuCopyTextureToBuffer(_, _, _, dst, _) => dst == b
+        _                                       => false
 
 // Does this list touch this buffer?
 //
@@ -288,7 +444,7 @@ pub fn workgroups_for(items: Int, workgroup_size: Int) -> Int []
 //     println("whether a frame touches a buffer")
 // ```
 pub fn uses_buffer(l: GpuCommandList, b: GpuBufferId) -> Bool []
-    todo("gpu-nv.gpucmd.uses_buffer")
+    list.any(l.commands, c => command_uses_buffer(c, b))
 
 // How many draws and dispatches a list holds.
 //
@@ -307,7 +463,32 @@ pub fn uses_buffer(l: GpuCommandList, b: GpuBufferId) -> Bool []
 //     println("how much work a frame asks for")
 // ```
 pub fn work_count(l: GpuCommandList) -> GpuWorkCount []
-    todo("gpu-nv.gpucmd.work_count")
+    var draws = 0
+    var dispatches = 0
+    var passes = 0
+    var upload_bytes = 0
+    for c in l.commands
+        match c
+            GpuDraw(_, _)                     =>
+                draws += 1
+            GpuDispatch(_, _, _)              =>
+                dispatches += 1
+            GpuBeginRenderPass(_, _, _, _, _) =>
+                passes += 1
+            GpuBeginRenderPassLoad(_)         =>
+                passes += 1
+            GpuBeginComputePass               =>
+                passes += 1
+            GpuWriteBuffer(_, _, data)        =>
+                upload_bytes += bytes.len(data)
+            GpuWriteTexture(_, _, _, data)    =>
+                upload_bytes += bytes.len(data)
+            _                                 => ()
+    GpuWorkCount {
+        draws: draws,
+        dispatches: dispatches,
+        passes: passes,
+        upload_bytes: upload_bytes }
 
 // What a list would actually do.
 pub struct GpuWorkCount

@@ -9,11 +9,6 @@ and checks with no device present, a frame is a list of commands, and the one
 thing that talks to hardware is a trait a program supplies an implementation
 of.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it
-is implemented. Version 0.1.0 will be the first working release.
-
 ## What it is
 
 An **adapter** is one GPU the machine can see. A **device** is an open
@@ -84,9 +79,10 @@ fn main() [io]
     println("${gpucmd.length(frame)}")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test` fails
-on purpose: every test reaches a `not implemented: gpu-nv.<module>.<fn>` panic.
-The tests are the specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`. The tests are the
+specification, and none of them needs a GPU: the resource, command and shader
+suites assert values, and the driver suite asserts against an implementation
+of `GpuDriver` that records the calls it was given.
 
 ## What the package contains
 
@@ -251,40 +247,9 @@ as a `NoDriver` that answers `GpuNoAdapter` to everything, which is itself an
 assertion: a trait a test cannot implement in one screen is one a second
 backend will not implement either.
 
-The tests compile today and fail at run, each on the
-`not implemented: gpu-nv.<module>.<fn>` panic that is its body. That is the
-expected state of an interface release. They turn green one at a time as
-bodies land. `novo test --isolate tests/<file>` prints one verdict per test.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `gpures.GpuBackend`, `.GpuAdapterKind`, `.GpuAdapterInfo`, `.GpuLimits`, `.GpuFault` | the types are declared; nothing constructs one |
-| `gpures.GpuDeviceId`, `.GpuQueueId`, `.GpuBufferId`, `.GpuTextureId`, `.GpuViewId` | the types are declared |
-| `gpures.GpuSamplerId`, `.GpuShaderId`, `.GpuPipelineId`, `.GpuLayoutId`, `.GpuBindGroupId` | the types are declared |
-| `gpures.GpuBufferUsage`, `.GpuBufferDesc`, `.GpuTextureFormat`, `.GpuTextureDesc`, `.GpuSamplerDesc` | the types are declared |
-| `gpures.no_usage`, `.storage_usage`, `.read_usage`, `.usage_is_legal` | no |
-| `gpures.buffer`, `.texture_2d`, `.sampler_nearest_clamp` | no |
-| `gpures.row_bytes`, `.padded_row_bytes`, `.format_bytes` | no |
-| `gpures.fits_limits`, `.texture_fits_limits`, `.baseline_limits` | no |
-| `gpures.is_software`, `.preferred_adapter`, `.backend_name` | no |
-| `gpucmd.GpuCommand`, `.GpuCommandList`, `.GpuListFault`, `.GpuWorkCount` | the types are declared; nothing constructs one |
-| `gpucmd.list`, `.push`, `.extend`, `.length`, `.uses_buffer`, `.work_count` | no |
-| `gpucmd.validate` | no |
-| `gpucmd.render_pass`, `.compute_pass`, `.compute_round_trip`, `.workgroups_for` | no |
-| `gpushader.GpuShaderDesc`, `.GpuStages`, `.GpuBindingKind`, `.GpuBindingDesc`, `.GpuLayoutDesc` | the types are declared; nothing constructs one |
-| `gpushader.GpuBindingValue`, `.GpuBindingSlot`, `.GpuBindGroupDesc`, `.GpuWorkgroupSize` | the types are declared |
-| `gpushader.GpuVertexAttribute`, `.GpuVertexBufferDesc`, `.GpuRenderPipelineDesc`, `.GpuComputePipelineDesc` | the types are declared |
-| `gpushader.shader`, `.stages`, `.layout`, `.sampler_texture_layout` | no |
-| `gpushader.bindings_of_wgsl`, `.layouts_agree`, `.has_entry_point`, `.workgroup_size_of` | no |
-| `gpushader.vertex_buffer`, `.attribute`, `.stride_fits`, `.required_stride` | no |
-| `gpushader.render_pipeline`, `.compute_pipeline`, `.bind_group`, `.missing_bindings` | no |
-| `gpudriver.GpuDriver`, and all thirteen of its members | the trait is declared; no implementation is shipped |
-| `gpudriver.GpuOpenDevice`, `.GpuTextureView`, `.GpuSubmission`, `.GpuResource`, `.GpuReadbackPair` | the types are declared |
-| `gpudriver.open_best`, `.validate_and_submit`, `.submit_and_read` | no |
-| `gpudriver.create_checked_shader`, `.create_readback_pair` | no |
-| `gpudriver.release_all`, `.release_rank`, `.needs_recreate` | no |
+`novo test --isolate tests/<file>` prints one verdict per test. The suites
+share no state, so the isolation is free, and it is how a failure is read
+without the other three files' output around it.
 
 ## Licence
 

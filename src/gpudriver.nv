@@ -1,7 +1,5 @@
 // gpudriver.nv — the boundary, and the only place anything performs.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `GpuDriver` IS THE SEAM, AND IT IS DELIBERATELY SMALL.  Everything
 // this package does — describing a resource, recording a frame,
 // checking a layout against a shader — is a value.  What remains is
@@ -36,7 +34,10 @@
 // NOTHING IN THIS MODULE DECODES ANYTHING.  The values are gpures's,
 // the lists are gpucmd's, and this is the part that performs.
 
+use std.list
 use gpures
+use gpucmd
+use gpushader
 
 // What a driver can do.
 //
@@ -132,6 +133,48 @@ pub enum GpuResource
     GpuReleaseBindGroup(id: GpuBindGroupId)
     GpuReleaseDevice(id: GpuDeviceId)
 
+// THE DYNAMIC CALLS ARE MADE IN THESE, AND THAT IS NOT A STYLE CHOICE.
+//
+// On 0.20.2 a `Result` that a `dyn`-dispatched trait method answers is
+// leaked by the function that matches it — one object per call, plus
+// every heap value the payload carries — while a call whose `Result` is
+// returned straight out of the receiving function is clean.  Measured
+// on this module's own seam and filed as
+// `memory-perceus/a-trait-method-reached-through-dyn-leaks-the-result-it-returns`.
+//
+// So every call this module has to look at the ANSWER of is made here,
+// in a one-line tail-returning wrapper: the wrapper returns the
+// `Result` out, and unpacking or matching it happens at a caller that
+// reached it by a static call.  `d.submit` and the rest of the seam are
+// unchanged — this is the caller's side of a caller-side leak.
+//
+// A wrapper is where a driver's own `[io, time]` row lands, which is why
+// each of these repeats the row of the member it calls.
+fn adapters_of(d: dyn GpuDriver) -> Result<[GpuAdapterInfo], GpuFault> [io]
+    d.adapters()
+
+fn open_device_of(d: dyn GpuDriver, a: GpuAdapterInfo) -> Result<GpuOpenDevice, GpuFault> [io, time]
+    d.open_device(a)
+
+fn create_buffer_of(d: dyn GpuDriver, dev: GpuDeviceId,
+                    desc: GpuBufferDesc) -> Result<GpuBufferId, GpuFault> [io]
+    d.create_buffer(dev, desc)
+
+fn create_shader_of(d: dyn GpuDriver, dev: GpuDeviceId,
+                    desc: GpuShaderDesc) -> Result<GpuShaderId, GpuFault> [io]
+    d.create_shader(dev, desc)
+
+fn submit_of(d: dyn GpuDriver, queue: GpuQueueId,
+             l: GpuCommandList) -> Result<GpuSubmission, GpuFault> [io, time]
+    d.submit(queue, l)
+
+fn read_buffer_of(d: dyn GpuDriver, dev: GpuDeviceId, s: GpuSubmission, b: GpuBufferId,
+                  size_bytes: Int) -> Result<Bytes, GpuFault> [io, time]
+    d.read_buffer(dev, s, b, size_bytes)
+
+fn release_of(d: dyn GpuDriver, dev: GpuDeviceId, r: GpuResource) -> Result<Unit, GpuFault> [io]
+    d.release(dev, r)
+
 // Open the best device a driver can see.
 //
 // The three steps every program starts with — enumerate, pick, open —
@@ -150,7 +193,10 @@ pub enum GpuResource
 // ```
 pub fn open_best(d: dyn GpuDriver,
                  allow_software: Bool) -> Result<GpuOpenDevice, GpuFault> [io, time]
-    todo("gpu-nv.gpudriver.open_best")
+    let all = adapters_of(d)!
+    match gpures.preferred_adapter(all, allow_software)
+        None    => Err(GpuNoAdapter)
+        Some(a) => open_device_of(d, a)
 
 // Check a list against this device's limits, then submit it.
 //
@@ -173,7 +219,15 @@ pub fn open_best(d: dyn GpuDriver,
 // ```
 pub fn validate_and_submit(d: dyn GpuDriver, dev: GpuOpenDevice,
                            l: GpuCommandList) -> Result<GpuSubmission, GpuFault> [io, time]
-    todo("gpu-nv.gpudriver.validate_and_submit")
+    let faults = gpucmd.validate(l, dev.limits)
+    if list.len(faults) > 0
+        // The first fault, as a line.  A caller that wants all of them
+        // has `gpucmd.validate` itself; a caller that submits wants the
+        // reason it will not be submitted.
+        let first = list.get(faults, 0)
+        Err(GpuBadCommandList(detail: first.message()))
+    else
+        submit_of(d, dev.queue, l)
 
 // Submit a list and read one buffer back, in one call.
 //
@@ -193,7 +247,12 @@ pub fn validate_and_submit(d: dyn GpuDriver, dev: GpuOpenDevice,
 // ```
 pub fn submit_and_read(d: dyn GpuDriver, dev: GpuOpenDevice, l: GpuCommandList,
                        readback: GpuBufferId, size_bytes: Int) -> Result<Bytes, GpuFault> [io, time]
-    todo("gpu-nv.gpudriver.submit_and_read")
+    let submission = validate_and_submit(d, dev, l)!
+    read_buffer_of(d, dev.device, submission, readback, size_bytes)
+
+// The first of `names` the source does not declare, or `None`.
+fn first_missing_entry(wgsl: Str, names: [Str]) -> ?Str
+    list.find(names, n => not gpushader.has_entry_point(wgsl, n))
 
 // Build a shader, checking its entry points before the driver does.
 //
@@ -215,7 +274,10 @@ pub fn submit_and_read(d: dyn GpuDriver, dev: GpuOpenDevice, l: GpuCommandList,
 // ```
 pub fn create_checked_shader(d: dyn GpuDriver, dev: GpuOpenDevice, s: GpuShaderDesc,
                              entry_points: [Str]) -> Result<GpuShaderId, GpuFault> [io]
-    todo("gpu-nv.gpudriver.create_checked_shader")
+    match first_missing_entry(s.wgsl, entry_points)
+        Some(name) =>
+            Err(GpuShaderFailed(message: "the shader declares no entry point named ${name}"))
+        None       => create_shader_of(d, dev.device, s)
 
 // Allocate the pair a compute readback needs.
 //
@@ -234,7 +296,17 @@ pub fn create_checked_shader(d: dyn GpuDriver, dev: GpuOpenDevice, s: GpuShaderD
 // ```
 pub fn create_readback_pair(d: dyn GpuDriver, dev: GpuOpenDevice, label: Str,
                             size_bytes: Int) -> Result<GpuReadbackPair, GpuFault> [io]
-    todo("gpu-nv.gpudriver.create_readback_pair")
+    let storage = create_buffer_of(d, dev.device,
+                                   gpures.buffer(label, size_bytes, gpures.storage_usage()))!
+    match create_buffer_of(d, dev.device, gpures.buffer(label, size_bytes, gpures.read_usage()))
+        Ok(readback) => Ok(GpuReadbackPair { storage: storage, readback: readback })
+        Err(f)       =>
+            // A half-made pair is worse than none, so the buffer that
+            // was made goes back before the fault travels.  A release
+            // that fails here does not replace the reason the pair
+            // could not be made.
+            let _ = release_of(d, dev.device, GpuReleaseBuffer(id: storage))
+            Err(f)
 
 // The two buffers a compute readback needs.
 pub struct GpuReadbackPair
@@ -261,7 +333,14 @@ pub struct GpuReadbackPair
 // ```
 pub fn release_all(d: dyn GpuDriver, dev: GpuOpenDevice,
                    resources: [GpuResource]) -> Result<Unit, GpuFault> [io]
-    todo("gpu-nv.gpudriver.release_all")
+    // Sorted, so a caller's list is released in the order a backend
+    // allows rather than the order it happened to be built in.  The
+    // clone is what keeps this a value: `list.sort_by` sorts in place,
+    // and a caller's list is not this function's to reorder.
+    let ordered = list.sort_by(list.clone(resources), r => release_rank(r))
+    for r in ordered
+        release_of(d, dev.device, r)!
+    Ok()
 
 // The order `release_all` uses, as a value.
 //
@@ -275,7 +354,16 @@ pub fn release_all(d: dyn GpuDriver, dev: GpuOpenDevice,
 //     println("${gpudriver.release_rank(GpuReleaseBindGroup(id: GpuBindGroupId { handle: 1 }))}")
 // ```
 pub fn release_rank(r: GpuResource) -> Int []
-    todo("gpu-nv.gpudriver.release_rank")
+    match r
+        GpuReleaseBindGroup(_) => 0
+        GpuReleasePipeline(_)  => 1
+        GpuReleaseShader(_)    => 2
+        GpuReleaseLayout(_)    => 3
+        GpuReleaseView(_)      => 4
+        GpuReleaseTexture(_)   => 5
+        GpuReleaseSampler(_)   => 6
+        GpuReleaseBuffer(_)    => 7
+        GpuReleaseDevice(_)    => 8
 
 // Is this fault one where every resource has to be made again?
 //
@@ -296,4 +384,6 @@ pub fn release_rank(r: GpuResource) -> Int []
 //     println("whether everything has to be made again")
 // ```
 pub fn needs_recreate(f: GpuFault) -> Bool []
-    todo("gpu-nv.gpudriver.needs_recreate")
+    match f
+        GpuDeviceLost(_) => true
+        _                => false

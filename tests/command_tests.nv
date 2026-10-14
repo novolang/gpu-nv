@@ -1,9 +1,6 @@
 // command_tests.nv — a frame is a value, so a machine with no GPU can
 // check one.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: gpu-nv.<module>.<fn>`.
-//
 // WHAT THIS FILE IS ABOUT, AND WHY IT CAN EXIST AT ALL.  Every
 // assertion here is about a recorded list rather than about a device.
 // That is the point of the design: a frame built with an encoder can
@@ -134,7 +131,7 @@ fn test_a_compute_round_trip_includes_the_copy_everybody_leaves_out() [io]
     test.assert(gpucmd.uses_buffer(l, GpuBufferId { handle: 6 }))
 
     test.case("and not one it was never given")
-    test.assert(gpucmd.uses_buffer(l, GpuBufferId { handle: 99 }) == false)
+    test.assert(not gpucmd.uses_buffer(l, GpuBufferId { handle: 99 }))
 
 @test
 fn test_the_last_partial_workgroup_is_not_dropped() [io]

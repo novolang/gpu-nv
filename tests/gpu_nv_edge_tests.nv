@@ -1,0 +1,650 @@
+// gpu_nv_edge_tests.nv — the lines the three release suites leave.
+//
+// A SUPPLEMENTARY SUITE, AND THIS IS WHAT THE COVERAGE GATE ASKS FOR.
+// `resource_tests`, `command_tests` and `shader_tests` assert the
+// behaviour a caller depends on; what they leave is the rest of `src/`
+// — the arms of the small matches nothing had printed yet, the
+// refusals in the WGSL scan, and the two dispatch axes nobody had taken
+// past the adapter's limit.  Every line here is reachable without a
+// device: the modules under test are values and text, and the one thing
+// that performs, `gpudriver.GpuDriver`, is exercised against a
+// recording double in `gpudriver_edge_tests.nv`.
+//
+// It is named for the package rather than for one module because the
+// gap it closes is in all three of them.
+//
+// One line under `src/` is covered by no suite at all —
+// `gpushader.type_name`'s `at < 0` arm, which its only caller has
+// already refused — and that line carries a `cov: skip` marker naming
+// the guard that makes it unreachable.
+
+use std.test
+use std.list
+use std.bytes
+use gpures
+use gpucmd
+use gpushader
+
+// A view, a pipeline and a buffer, so a case reads as the frame it is.
+fn a_view() -> GpuViewId
+    GpuViewId { handle: 1 }
+
+fn a_pipeline() -> GpuPipelineId
+    GpuPipelineId { handle: 2 }
+
+fn a_buffer() -> GpuBufferId
+    GpuBufferId { handle: 3 }
+
+// Several commands, as a list with a label.
+fn a_frame(cs: [GpuCommand]) -> GpuCommandList
+    gpucmd.extend(gpucmd.list("frame"), cs)
+
+// The first fault a frame has, as its line, or "" when it is legal.
+//
+// The FIRST one, because that is the fault `gpudriver.validate_and_submit`
+// turns into the reason a frame was not sent.
+fn first_fault(l: GpuCommandList) -> Str
+    match list.first(gpucmd.validate(l, gpures.baseline_limits()))
+        None    => ""
+        Some(f) => f.message()
+
+// The first binding a source declares, or `None`.
+fn first_binding(wgsl: Str) -> ?GpuBindingDesc
+    list.first(gpushader.bindings_of_wgsl(wgsl))
+
+// A declaration of one storage texture in the format named.
+//
+// The form the scan reads: an attribute pair, `var`, and a handle type
+// that carries the format in its first type argument.
+fn a_storage_declaration(format: Str) -> Str
+    "@group(0) @binding(0) var out: texture_storage_2d<${format}, write>;\n"
+
+// A layout whose group 0 binds one storage texture in the format named.
+fn a_storage_layout(format: GpuTextureFormat) -> GpuLayoutDesc
+    gpushader.layout("store", 0,
+                     [GpuBindingDesc { binding: 0,
+                                       kind: GpuStorageTexture(format: format),
+                                       stages: gpushader.stages(false, false, true) }])
+
+// A layout whose group 0 binds one binding of the kind named, for the
+// cases about a kind that does not match.
+fn a_layout_of(kind: GpuBindingKind) -> GpuLayoutDesc
+    gpushader.layout("mismatch", 0,
+                     [GpuBindingDesc { binding: 0, kind: kind,
+                                       stages: gpushader.stages(true, true, true) }])
+
+// A source that declares one sampler at group 0, binding 0.
+fn a_sampler_declaration() -> Str
+    "@group(0) @binding(0) var s: sampler;\n"
+
+// The only fault this layout and source have, as its line.
+fn the_only_fault(l: GpuLayoutDesc, wgsl: Str) -> Str
+    let faults = gpushader.layouts_agree(l, wgsl)
+    if list.len(faults) != 1
+        "expected exactly one fault and got ${list.len(faults)}"
+    else
+        list.first(faults) ?? ""
+
+// ── gpures: the faults, the arithmetic, the last two enums ───────────
+
+@test
+fn test_a_limit_answers_the_limit_named_and_both_numbers() [io]
+    // The fault whose message nothing had printed.  A message that named
+    // neither number would send a reader back to the source with a
+    // number they could have been told.
+    let l = gpures.baseline_limits()
+
+    test.case("a descriptor past a limit")
+    test.assert_eq_str(GpuOverLimit(limit: "max_buffer_bytes", asked: 4096,
+                                    allowed: 1024).message(),
+                       "gpu-nv: max_buffer_bytes is 4096 and the adapter allows 1024")
+
+    test.case("and the same fault out of a texture, which is where a caller meets it")
+    // A texture is over the limit on EITHER dimension, and the height is
+    // the one the release suite's square fixture cannot tell from the
+    // width — it is over on both at once.
+    match gpures.texture_fits_limits(gpures.texture_2d("tall", 8, 9000, GpuRgba8Unorm), l)
+        None    => test.assert(false)
+        Some(f) => test.assert_eq_str(f.message(),
+                                      "gpu-nv: max_texture_dimension_2d is 9000 and the adapter allows 8192")
+
+@test
+fn test_the_two_faults_that_carry_a_number_of_their_own() [io]
+    test.case("a row stride that is not a multiple of the alignment")
+    test.assert_eq_str(GpuBadRowAlignment(bytes_per_row: 260, alignment: 256).message(),
+                       "gpu-nv: a row stride of 260 is not a multiple of 256")
+
+    test.case("and a driver the package does not model, with its code intact")
+    test.assert_eq_str(GpuDriverError(code: 7, message: "out of memory").message(),
+                       "gpu-nv: the driver answered 7: out of memory")
+
+@test
+fn test_an_alignment_that_is_no_alignment_answers_the_unpadded_row() [io]
+    // An alignment of zero or less is not something to round to, and the
+    // unpadded row is the only answer that is not a division by zero.
+    test.case("the row itself")
+    test.assert_eq(gpures.row_bytes(GpuRgba8Unorm, 65), 260)
+
+    test.case("and what the padding answers when there is none to do")
+    test.assert_eq(gpures.padded_row_bytes(GpuRgba8Unorm, 65, 0), 260)
+    test.assert_eq(gpures.padded_row_bytes(GpuRgba8Unorm, 65, -1), 260)
+
+@test
+fn test_every_8_bit_format_is_four_bytes_and_an_unread_one_is_zero() [io]
+    // Zero is this package saying it does not know rather than a size: a
+    // compressed or depth format's bytes per pixel is the driver's to
+    // report, and 0 makes the row arithmetic visibly wrong instead of
+    // plausibly wrong.
+    test.case("four bytes a pixel, sRGB or not")
+    test.assert_eq(gpures.format_bytes(GpuRgba8UnormSrgb), 4)
+    test.assert_eq(gpures.format_bytes(GpuBgra8Unorm), 4)
+
+    test.case("and a format the package does not name")
+    test.assert_eq(gpures.format_bytes(GpuFormatOther(code: 6)), 0)
+
+@test
+fn test_a_virtual_adapter_has_a_rank_and_it_is_the_last_one() [io]
+    // Every kind a driver can report has to have a rank, or the
+    // preference rule is answered by a machine nobody tested with.
+    let virtual = GpuAdapterInfo { name: "virtio", vendor: "v", kind: GpuVirtual,
+                                   backend: GpuVulkan, driver: "1" }
+    let discrete = GpuAdapterInfo { name: "real", vendor: "v", kind: GpuDiscrete,
+                                    backend: GpuVulkan, driver: "1" }
+
+    test.case("a virtual adapter is not a software rasteriser")
+    test.assert(not gpures.is_software(virtual))
+
+    test.case("so it is usable, and it is picked when it is the only one")
+    match gpures.preferred_adapter([virtual], false)
+        None    => test.assert(false)
+        Some(a) => test.assert_eq_str(a.name, "virtio")
+
+    test.case("and it loses to a discrete one, which is what the rank is for")
+    match gpures.preferred_adapter([virtual, discrete], false)
+        None    => test.assert(false)
+        Some(a) => test.assert_eq_str(a.name, "real")
+
+@test
+fn test_every_backend_has_a_name_a_bug_report_can_carry() [io]
+    test.case("the three the release suite does not ask about")
+    test.assert_eq_str(gpures.backend_name(GpuMetal), "Metal")
+    test.assert_eq_str(gpures.backend_name(GpuDirect3d12), "Direct3D 12")
+    test.assert_eq_str(gpures.backend_name(GpuWebGpu), "WebGPU")
+
+// ── gpucmd: every fault line, and every state the walk can be in ─────
+
+@test
+fn test_every_command_fault_says_which_command_and_what_is_wrong() [io]
+    // A position and a name, where an encoder-based API answers a driver
+    // error with a handle number in it.
+    test.case("a pass already open, and a pass that was never opened")
+    test.assert_eq_str(GpuPassAlreadyOpen(at: 2).message(),
+                       "gpu-nv: command 2 begins a pass while another is open")
+    test.assert_eq_str(GpuNoPassOpen(at: 1).message(),
+                       "gpu-nv: command 1 ends a pass and none is open")
+
+    test.case("a pass left open")
+    test.assert_eq_str(GpuPassNotEnded(at: 0).message(),
+                       "gpu-nv: the pass that begins at command 0 is never ended")
+
+    test.case("a draw or a dispatch with nothing set to run")
+    test.assert_eq_str(GpuNoPipeline(at: 3).message(),
+                       "gpu-nv: command 3 draws or dispatches with no pipeline set in this pass")
+    test.assert_eq_str(GpuWrongPassKind(at: 4, command: "a draw").message(),
+                       "gpu-nv: command 4 is a draw in the wrong kind of pass")
+
+    test.case("a dispatch past the limit, which names the axis as well")
+    test.assert_eq_str(GpuDispatchTooLarge(at: 5, axis: "y", asked: 70000,
+                                           allowed: 65535).message(),
+                       "gpu-nv: command 5 dispatches 70000 workgroups on y and the adapter allows 65535")
+
+    test.case("a copy whose row stride is not a multiple of the alignment")
+    test.assert_eq_str(GpuUnalignedCopy(at: 6, bytes_per_row: 260, alignment: 256).message(),
+                       "gpu-nv: command 6 copies with a row stride of 260, which is not a multiple of 256")
+
+    test.case("and a debug label pushed and never popped")
+    test.assert_eq_str(GpuUnbalancedLabels(at: 7).message(),
+                       "gpu-nv: the debug label at command 7 has no matching pop")
+
+@test
+fn test_the_pass_walk_names_each_way_a_frame_is_unbalanced() [io]
+    let opening = GpuBeginRenderPass(target: a_view(), r: 0.0, g: 0.0, b: 0.0, a: 1.0)
+
+    test.case("a render pass begun inside a render pass")
+    test.assert_eq_str(first_fault(a_frame([opening, opening, GpuEndPass])),
+                       "gpu-nv: command 1 begins a pass while another is open")
+
+    test.case("a load pass begun inside one, too")
+    test.assert_eq_str(first_fault(a_frame([opening, GpuBeginRenderPassLoad(target: a_view()),
+                                            GpuEndPass])),
+                       "gpu-nv: command 1 begins a pass while another is open")
+
+    test.case("and a load pass on its own is a pass like any other")
+    test.assert_eq_str(first_fault(a_frame([GpuBeginRenderPassLoad(target: a_view()),
+                                            GpuEndPass])),
+                       "")
+
+    test.case("a compute pass begun inside a render pass")
+    test.assert_eq_str(first_fault(a_frame([opening, GpuBeginComputePass, GpuEndPass])),
+                       "gpu-nv: command 1 begins a pass while another is open")
+
+    test.case("an end with no pass open")
+    test.assert_eq_str(first_fault(a_frame([GpuEndPass])),
+                       "gpu-nv: command 0 ends a pass and none is open")
+
+    test.case("a pipeline set outside any pass")
+    test.assert_eq_str(first_fault(a_frame([GpuSetPipeline(pipeline: a_pipeline())])),
+                       "gpu-nv: command 0 is outside any pass")
+
+    test.case("a bind group set outside any pass")
+    test.assert_eq_str(first_fault(a_frame([GpuSetBindGroup(slot: 0,
+                                                            group: GpuBindGroupId { handle: 5 })])),
+                       "gpu-nv: command 0 is outside any pass")
+
+    test.case("and a vertex buffer bound outside any pass")
+    test.assert_eq_str(first_fault(a_frame([GpuSetVertexBuffer(slot: 0, buffer: a_buffer(),
+                                                               offset_bytes: 0, size_bytes: 16)])),
+                       "gpu-nv: command 0 is outside any pass")
+
+    test.case("a pass the frame never ends, named where it began and not where the walk noticed")
+    // The fault is answered after the whole list has been walked, so
+    // the position it names has to be the position the pass opened at
+    // and not the end of the list.
+    test.assert_eq_str(first_fault(a_frame([GpuWriteBuffer(buffer: a_buffer(),
+                                                           offset_bytes: 0,
+                                                           data: bytes.zeros(4)),
+                                            GpuBeginRenderPassLoad(target: a_view())])),
+                       "gpu-nv: the pass that begins at command 1 is never ended")
+
+@test
+fn test_a_draw_and_a_dispatch_are_each_wrong_the_other_way_round() [io]
+    // A draw in a compute pass and a dispatch in a render pass are the
+    // same one-line mistake, and each names the command that made it.
+    test.case("a draw inside a compute pass")
+    test.assert_eq_str(first_fault(a_frame(gpucmd.compute_pass([GpuSetPipeline(pipeline: a_pipeline()),
+                                                                GpuDraw(vertex_count: 6,
+                                                                        instance_count: 1)]))),
+                       "gpu-nv: command 2 is a draw in the wrong kind of pass")
+
+    test.case("a dispatch outside any pass")
+    test.assert_eq_str(first_fault(a_frame([GpuDispatch(x: 1, y: 1, z: 1)])),
+                       "gpu-nv: command 0 is outside any pass")
+
+    test.case("and a dispatch in a compute pass with no pipeline set")
+    test.assert_eq_str(first_fault(a_frame(gpucmd.compute_pass([GpuDispatch(x: 1, y: 1,
+                                                                            z: 1)]))),
+                       "gpu-nv: command 1 draws or dispatches with no pipeline set in this pass")
+
+@test
+fn test_a_dispatch_past_the_limit_on_y_or_z_is_named_with_its_axis() [io]
+    // The limit is on workgroups along ONE axis, so a caller fixing a
+    // frame has to be told which one — and x is not the only one.
+    test.case("y")
+    test.assert_eq_str(first_fault(a_frame(gpucmd.compute_pass([GpuSetPipeline(pipeline: a_pipeline()),
+                                                                GpuDispatch(x: 1, y: 70000,
+                                                                            z: 1)]))),
+                       "gpu-nv: command 2 dispatches 70000 workgroups on y and the adapter allows 65535")
+
+    test.case("and z")
+    test.assert_eq_str(first_fault(a_frame(gpucmd.compute_pass([GpuSetPipeline(pipeline: a_pipeline()),
+                                                                GpuDispatch(x: 1, y: 1,
+                                                                            z: 70000)]))),
+                       "gpu-nv: command 2 dispatches 70000 workgroups on z and the adapter allows 65535")
+
+@test
+fn test_a_label_is_balanced_or_it_is_a_named_fault() [io]
+    test.case("a label pushed and popped is balanced")
+    test.assert_eq_str(first_fault(a_frame([GpuPushLabel(name: "glyphs"), GpuPopLabel])),
+                       "")
+
+    test.case("a pop with nothing pushed")
+    test.assert_eq_str(first_fault(a_frame([GpuPopLabel])),
+                       "gpu-nv: the debug label at command 0 has no matching pop")
+
+    test.case("and a label the frame never closes, named where it was pushed")
+    test.assert_eq_str(first_fault(a_frame([GpuBeginRenderPassLoad(target: a_view()),
+                                            GpuEndPass,
+                                            GpuPushLabel(name: "glyphs")])),
+                       "gpu-nv: the debug label at command 2 has no matching pop")
+
+@test
+fn test_a_frame_is_counted_by_every_kind_of_work_it_holds() [io]
+    // The count a renderer defends its batching with, over the commands
+    // the release suite's single-draw frame does not hold.
+    let frame = a_frame([GpuWriteBuffer(buffer: a_buffer(), offset_bytes: 0,
+                                        data: bytes.zeros(16)),
+                         GpuWriteTexture(texture: GpuTextureId { handle: 4 }, width: 2,
+                                         height: 2, data: bytes.zeros(24)),
+                         GpuBeginRenderPassLoad(target: a_view()),
+                         GpuEndPass,
+                         GpuBeginComputePass,
+                         GpuSetPipeline(pipeline: a_pipeline()),
+                         GpuDispatch(x: 1, y: 1, z: 1),
+                         GpuEndPass])
+    let w = gpucmd.work_count(frame)
+
+    test.case("one dispatch, and no draws at all")
+    test.assert_eq(w.dispatches, 1)
+    test.assert_eq(w.draws, 0)
+
+    test.case("two passes, one of them a load pass")
+    test.assert_eq(w.passes, 2)
+
+    test.case("and the bytes of both uploads, added up")
+    test.assert_eq(w.upload_bytes, 40)
+
+@test
+fn test_a_buffer_is_named_by_the_vertex_binding_and_by_a_readback() [io]
+    // Every command that carries a `GpuBufferId`, so a caller holding a
+    // buffer back until a frame has run asks the frame rather than
+    // trusting its own bookkeeping.
+    test.case("the vertex binding names its buffer")
+    let drawn = a_frame([GpuBeginRenderPass(target: a_view(), r: 0.0, g: 0.0, b: 0.0, a: 1.0),
+                         GpuSetPipeline(pipeline: a_pipeline()),
+                         GpuSetVertexBuffer(slot: 0, buffer: a_buffer(), offset_bytes: 64,
+                                            size_bytes: 16),
+                         GpuDraw(vertex_count: 6, instance_count: 1),
+                         GpuEndPass])
+    test.assert(gpucmd.uses_buffer(drawn, a_buffer()))
+
+    test.case("and a readback copy names the buffer it writes into")
+    let readback = a_frame([GpuCopyTextureToBuffer(texture: GpuTextureId { handle: 4 },
+                                                   width: 8, height: 8, dst: a_buffer(),
+                                                   bytes_per_row: 256)])
+    test.assert(gpucmd.uses_buffer(readback, a_buffer()))
+
+// ── gpushader: the scan's refusals, and the kinds it can read ────────
+
+@test
+fn test_the_scan_refuses_a_declaration_it_cannot_read() [io]
+    // The scan is a scan and not a parse, and every refusal is an empty
+    // list rather than a wrong binding.
+    test.case("an attribute with no parentheses at all")
+    test.assert_eq(list.len(gpushader.bindings_of_wgsl(
+        "@group(0) @binding var<uniform> u: f32;\n")),
+        0)
+
+    test.case("and one that opens a parenthesis it never closes")
+    test.assert_eq(list.len(gpushader.bindings_of_wgsl(
+        "@group(0 @binding var<uniform> u: f32;\n")),
+        0)
+
+    test.case("the attributes with no `var` under them")
+    test.assert_eq(list.len(gpushader.bindings_of_wgsl(
+        "@group(0) @binding(1) const X: u32 = 1u;\n")),
+        0)
+
+@test
+fn test_a_var_declaration_is_read_by_its_address_space_or_its_type() [io]
+    // `var<uniform> u: Uniforms` names its kind in the `<>` and not in
+    // the type; the handle kinds carry no address space and are named by
+    // the type alone.
+    test.case("the three address spaces that name a buffer kind")
+    test.assert_eq(list.len(gpushader.bindings_of_wgsl(
+        "@group(0) @binding(0) var<uniform> u: vec4f;\n")),
+        1)
+    test.assert_eq(list.len(gpushader.bindings_of_wgsl(
+        "@group(0) @binding(0) var<storage, read_write> s: vec4f;\n")),
+        1)
+    test.assert_eq(list.len(gpushader.bindings_of_wgsl(
+        "@group(0) @binding(0) var<storage, read> r: vec4f;\n")),
+        1)
+
+    test.case("a `var<` the scan cannot close is not a binding")
+    test.assert_eq(list.len(gpushader.bindings_of_wgsl(
+        "@group(0) @binding(0) var<uniform u: vec4f;\n")),
+        0)
+
+    test.case("and a declaration whose type the scan cannot name is not one either")
+    test.assert_eq(list.len(gpushader.bindings_of_wgsl(
+        "@group(0) @binding(0) var u: f32;\n")),
+        0)
+    test.assert_eq(list.len(gpushader.bindings_of_wgsl(
+        "@group(0) @binding(0) var u f32;\n")),
+        0)
+
+@test
+fn test_a_storage_texture_names_its_format() [io]
+    // The format is the first type argument, and one this package does
+    // not name travels as `GpuFormatOther`, which is also what an unread
+    // one is.
+    test.case("the four formats the package names")
+    match first_binding(a_storage_declaration("rgba8unorm-srgb"))
+        None    => test.assert(false)
+        Some(b) =>
+            match b.kind
+                GpuStorageTexture(f) => test.assert(f == GpuRgba8UnormSrgb)
+                _                    => test.assert(false)
+
+    match first_binding(a_storage_declaration("rgba8unorm"))
+        None    => test.assert(false)
+        Some(b) =>
+            match b.kind
+                GpuStorageTexture(f) => test.assert(f == GpuRgba8Unorm)
+                _                    => test.assert(false)
+
+    match first_binding(a_storage_declaration("bgra8unorm"))
+        None    => test.assert(false)
+        Some(b) =>
+            match b.kind
+                GpuStorageTexture(f) => test.assert(f == GpuBgra8Unorm)
+                _                    => test.assert(false)
+
+    match first_binding(a_storage_declaration("rgba32float"))
+        None    => test.assert(false)
+        Some(b) =>
+            match b.kind
+                GpuStorageTexture(f) => test.assert(f == GpuRgba32Float)
+                _                    => test.assert(false)
+
+    test.case("and a format the package does not name reads as the unknown one")
+    match first_binding(a_storage_declaration("r32float"))
+        None    => test.assert(false)
+        Some(b) =>
+            match b.kind
+                GpuStorageTexture(f) => test.assert(f == GpuFormatOther(code: 0))
+                _                    => test.assert(false)
+
+@test
+fn test_two_storage_textures_agree_unless_the_formats_disagree() [io]
+    // A layout that binds an `rgba8unorm` storage texture to a shader
+    // that writes `rgba32float` is a disagreement about bytes, not about
+    // kind — and a format the scan did not read is not a claim that it
+    // read a different one.
+    let wants_rgba8 = a_storage_declaration("rgba8unorm")
+
+    test.case("the same format agrees")
+    test.assert_eq(list.len(gpushader.layouts_agree(a_storage_layout(GpuRgba8Unorm),
+                                                    wants_rgba8)),
+                                                    0)
+
+    test.case("a different format does not, and the line names the binding")
+    test.assert_eq_str(the_only_fault(a_storage_layout(GpuRgba32Float), wants_rgba8),
+                       "gpushader: binding 0 of group 0 is a storage texture in the layout and a storage texture in the shader")
+
+    test.case("an unread format on the layout's side is not a disagreement")
+    test.assert_eq(list.len(gpushader.layouts_agree(a_storage_layout(GpuFormatOther(code: 0)),
+                                                    wants_rgba8)),
+                                                    0)
+
+    test.case("and a storage texture where the shader declares a sampled one is a disagreement about kind")
+    test.assert(list.len(gpushader.layouts_agree(a_storage_layout(GpuRgba8Unorm),
+                                                 "@group(0) @binding(0) var t: texture_2d<f32>;\n")) > 0)
+
+@test
+fn test_a_buffer_binding_that_names_the_wrong_kind_says_which_two() [io]
+    // The line a person reads when a uniform buffer is bound where the
+    // shader wanted a sampler.
+    let wants_sampler = a_sampler_declaration()
+
+    test.case("a uniform buffer")
+    test.assert_eq_str(the_only_fault(a_layout_of(GpuUniformBuffer(min_bytes: 64)),
+                                      wants_sampler),
+                       "gpushader: binding 0 of group 0 is a uniform buffer in the layout and a sampler in the shader")
+
+    test.case("a read-only storage buffer")
+    test.assert_eq_str(the_only_fault(a_layout_of(GpuReadStorageBuffer(min_bytes: 0)),
+                                      wants_sampler),
+                       "gpushader: binding 0 of group 0 is a read-only storage buffer in the layout and a sampler in the shader")
+
+    test.case("and a read-write one")
+    test.assert_eq_str(the_only_fault(a_layout_of(GpuReadWriteStorageBuffer(min_bytes: 0)),
+                                      wants_sampler),
+                       "gpushader: binding 0 of group 0 is a read-write storage buffer in the layout and a sampler in the shader")
+
+@test
+fn test_a_shader_that_declares_what_the_layout_does_not_bind_is_a_disagreement() [io]
+    // The other direction of the same check: a layout that forgot a
+    // binding the shader declares leaves the shader's slot unbound while
+    // the draw still succeeds.
+    test.case("a layout with nothing in it")
+    test.assert_eq_str(the_only_fault(gpushader.layout("empty", 0, []), a_sampler_declaration()),
+                       "gpushader: group 0 declares binding 0 and the layout does not bind it")
+
+    test.case("and a layout that binds that binding number in another group")
+    test.assert_eq(list.len(gpushader.layouts_agree(
+        gpushader.layout("other", 3, [GpuBindingDesc { binding: 0, kind: GpuSampler,
+                                                       stages: gpushader.stages(false, true,
+                                                                                false) }]),
+        a_sampler_declaration())),
+        1)
+
+@test
+fn test_a_source_the_scan_cannot_read_agrees_with_anything() [io]
+    // An empty declaration list is "unknown" rather than "nothing", which
+    // is why this is the one comparison that answers no faults: a
+    // refusal here would refuse every shader whose syntax this scan does
+    // not know.
+    test.assert_eq(list.len(gpushader.layouts_agree(gpushader.layout("empty", 0, []), "")), 0)
+
+@test
+fn test_an_entry_point_name_is_read_to_the_end_of_its_name() [io]
+    test.case("a name the source cannot hold is not a declaration")
+    test.assert(not gpushader.has_entry_point("fn a() {}", "a_very_long_entry_point"))
+
+    test.case("and neither is the empty name")
+    test.assert(not gpushader.has_entry_point("fn a() {}", ""))
+
+    test.case("while the name that is there is found")
+    test.assert(gpushader.has_entry_point("fn a() {}", "a"))
+
+@test
+fn test_a_workgroup_size_is_read_from_one_two_or_three_arguments() [io]
+    // One argument is x with y and z at the default of 1, and a
+    // component that was never written is not a zero.
+    test.case("three components, all of them written")
+    match gpushader.workgroup_size_of("@compute @workgroup_size(8, 4, 2) fn c() {}", "c")
+        None    => test.assert(false)
+        Some(w) =>
+            test.assert_eq(w.x, 8)
+            test.assert_eq(w.y, 4)
+            test.assert_eq(w.z, 2)
+
+    test.case("four components is a source this scan does not model")
+    test.assert_none(gpushader.workgroup_size_of("@workgroup_size(8, 4, 2, 1) fn c() {}", "c"))
+
+    test.case("and a component of zero is not a size")
+    test.assert_none(gpushader.workgroup_size_of("@workgroup_size(0) fn c() {}", "c"))
+
+@test
+fn test_a_workgroup_size_attribute_the_scan_cannot_read_is_none() [io]
+    // A text that mentions the attribute without being one, and one that
+    // opens a parenthesis it never closes: each answers `None` rather
+    // than a size read out of the wrong characters.
+    test.case("the attribute named with no argument list after it")
+    test.assert_none(gpushader.workgroup_size_of("// @workgroup_size\n@compute fn c() {}", "c"))
+
+    test.case("and one whose argument list is never closed")
+    test.assert_none(gpushader.workgroup_size_of("@compute @workgroup_size(8 fn c() {}", "c"))
+
+@test
+fn test_an_attribute_belongs_to_the_function_after_the_last_closing_brace() [io]
+    // Which is what stops one function's `@workgroup_size` from being
+    // read as the next one's.
+    test.case("a size declared before a function that has one")
+    match gpushader.workgroup_size_of("fn other() {}\n@compute @workgroup_size(4) fn c() {}", "c")
+        None    => test.assert(false)
+        Some(w) =>
+            test.assert_eq(w.x, 4)
+            test.assert_eq(w.y, 1)
+            test.assert_eq(w.z, 1)
+
+@test
+fn test_a_binding_s_minimum_size_is_not_compared_and_that_is_a_known_gap() [io]
+    // PINNED, NOT ENDORSED.  `GpuUniformBuffer` carries a `min_bytes`
+    // and `kinds_agree` compares kinds by name, so two buffers of the
+    // same kind agree whatever size each one asks for.  The size a
+    // shader wants is in the struct its declaration names, or in the
+    // array length inside it, and reading that is a parse of the
+    // language rather than a scan of it — so the scan answers 0 for
+    // every buffer and the comparison would be 0 against 0.  A layout
+    // that asks for 64 bytes therefore agrees with a shader whose
+    // uniform buffer is one float, and the disagreement is left to the
+    // driver's own layout validation.
+    test.case("a layout that asks for 64 bytes agrees with a 4-byte declaration")
+    let wants_64 = a_layout_of(GpuUniformBuffer(min_bytes: 64))
+    test.assert_eq(list.len(gpushader.layouts_agree(
+        wants_64, "@group(0) @binding(0) var<uniform> u: f32;\n")),
+        0)
+
+    test.case("and the size the scan reads is always zero")
+    match first_binding("@group(0) @binding(0) var<uniform> u: f32;\n")
+        None    => test.assert(false)
+        Some(b) =>
+            match b.kind
+                GpuUniformBuffer(n) => test.assert_eq(n, 0)
+                _                   => test.assert(false)
+
+    test.case("so the layout's own number is compared against nothing at all")
+    test.assert_eq(list.len(gpushader.layouts_agree(
+        a_layout_of(GpuUniformBuffer(min_bytes: 1)),
+        "@group(0) @binding(0) var<uniform> u: array<vec4f, 64>;\n")),
+        0)
+
+@test
+fn test_a_fn_inside_a_comment_is_read_as_a_declaration_and_that_is_a_known_gap() [io]
+    // PINNED, NOT ENDORSED.  The scan finds `fn` with a string search
+    // and checks the identifier after it; it does not skip comments, so
+    // a name that is only mentioned in one is found.  The typo this
+    // catches is a typo in a real declaration, which is the case that
+    // matters, and a source whose entry point is commented out is a
+    // source a driver refuses in its own words.
+    test.case("a name the source only mentions in a comment")
+    test.assert(gpushader.has_entry_point("// fn vs_main() {}\n@vertex fn real() {}\n",
+                                          "vs_main"))
+
+    test.case("and a name the source does not carry at all is still not there")
+    test.assert(not gpushader.has_entry_point("// fn vs_main() {}\n@vertex fn real() {}\n",
+                                              "fs_main"))
+
+    test.case("the identifier boundary holds inside the comment too")
+    test.assert(not gpushader.has_entry_point("// fn vs_main_extra() {}\n", "vs_main"))
+
+@test
+fn test_a_row_stride_the_caller_never_set_is_a_fault_and_not_a_sheared_image() [io]
+    // A row stride of zero is what a caller who built the descriptor and
+    // forgot the field passes, and it is not "no padding": the copy reads
+    // the whole image out of one row of bytes and the result is sheared
+    // with nothing to say so.
+    test.case("zero")
+    test.assert_eq_str(first_fault(a_frame([GpuCopyTextureToBuffer(texture: GpuTextureId { handle: 4 },
+                                                                    width: 65, height: 65,
+                                                                    dst: a_buffer(),
+                                                                    bytes_per_row: 0)])),
+                       "gpu-nv: command 0 copies with a row stride of 0, which is not a multiple of 256")
+
+    test.case("and the walk names the number the caller did pass, at the position it was passed")
+    test.assert_eq_str(first_fault(a_frame([GpuWriteBuffer(buffer: a_buffer(), offset_bytes: 0,
+                                                           data: bytes.zeros(4)),
+                                            GpuCopyTextureToBuffer(texture: GpuTextureId { handle: 4 },
+                                                                    width: 65, height: 65,
+                                                                    dst: a_buffer(),
+                                                                    bytes_per_row: 300)])),
+                       "gpu-nv: command 1 copies with a row stride of 300, which is not a multiple of 256")
+
+    test.case("and a stride that IS a multiple of the alignment is not a fault")
+    test.assert_eq_str(first_fault(a_frame([GpuCopyTextureToBuffer(texture: GpuTextureId { handle: 4 },
+                                                                    width: 65, height: 65,
+                                                                    dst: a_buffer(),
+                                                                    bytes_per_row: 512)])),
+                       "")

@@ -1,0 +1,445 @@
+// gpudriver_edge_tests.nv — the success half of the seam, and the calls
+// the seam makes.
+//
+// `shader_tests.nv` implements `GpuDriver` as `NoDriver`, which answers
+// `GpuNoAdapter` to all thirteen members.  That double proves the trait
+// is small enough for a test to implement and that a refusal travels all
+// the way out — and it reaches neither the `Ok` arm of any body in
+// `gpudriver` nor the calls those bodies make on the way: `open_best`'s
+// enumeration of the adapters, the storage buffer `create_readback_pair`
+// takes back when the read-back one cannot be made, and the rank order
+// `release_all` sorts by.
+//
+// This is the other double: one that answers, and one that REMEMBERS.
+// Every member below is a `var self` method that appends to `calls`
+// before it answers, which is what makes "the storage buffer goes back"
+// and "the resources go back in rank order" assertions rather than
+// comments.
+
+use std.test
+use std.list
+use std.bytes
+use gpures
+use gpucmd
+use gpushader
+use gpudriver
+
+// A driver that answers, and that remembers what it was asked.
+//
+// One `refuses` field rather than a flag per member, because the
+// interesting doubles are the ones that fail in exactly one place: a
+// test names the member it wants to refuse and everything else answers.
+pub struct Recorder
+    var calls: [Str]
+    // What `adapters` answers with.  Empty is a machine with no GPU.
+    // Not `var`: nothing writes it, and a writable field can only be
+    // built from a `var` name or a copy.
+    adapters: [GpuAdapterInfo]
+    // The one member that answers a fault instead of a value.
+    // "" refuses nothing; the names are below, at the member that reads
+    // each one.
+    var refuses: Str
+    // What `read_buffer` hands back.
+    var payload: Str
+
+fn a_recorder(adapters: [GpuAdapterInfo]) -> Recorder
+    Recorder { calls: [], adapters: adapters, refuses: "", payload: "" }
+
+fn a_refuser(adapters: [GpuAdapterInfo], member: Str) -> Recorder
+    Recorder { calls: [], adapters: adapters, refuses: member, payload: "" }
+
+fn an_adapter(name: Str, kind: GpuAdapterKind) -> GpuAdapterInfo
+    GpuAdapterInfo { name: name, vendor: "vendor", kind: kind,
+                     backend: GpuVulkan, driver: "1.0" }
+
+fn a_device() -> GpuOpenDevice
+    GpuOpenDevice {
+        device: GpuDeviceId { handle: 0 },
+        queue: GpuQueueId { handle: 0 },
+        limits: gpures.baseline_limits(),
+        adapter: an_adapter("none", GpuCpu) }
+
+fn usage_name(u: GpuBufferUsage) -> Str
+    if u.storage
+        "storage"
+    elif u.map_read
+        "read"
+    else
+        "other"
+
+// What a resource calls itself in the record.  The handle is in the
+// name because two buffers in one teardown is the ordinary case.
+fn resource_label(r: GpuResource) -> Str
+    match r
+        GpuReleaseBuffer(id)    => "release:buffer:${id.handle}"
+        GpuReleaseTexture(id)   => "release:texture:${id.handle}"
+        GpuReleaseView(id)      => "release:view:${id.handle}"
+        GpuReleaseSampler(id)   => "release:sampler:${id.handle}"
+        GpuReleaseShader(id)    => "release:shader:${id.handle}"
+        GpuReleasePipeline(id)  => "release:pipeline:${id.handle}"
+        GpuReleaseLayout(id)    => "release:layout:${id.handle}"
+        GpuReleaseBindGroup(id) => "release:bindgroup:${id.handle}"
+        GpuReleaseDevice(id)    => "release:device:${id.handle}"
+
+// A buffer the caller passes the read-back to, so `submit_and_read`'s
+// record can name the handle it read.
+fn a_readback() -> GpuBufferId
+    GpuBufferId { handle: 2 }
+
+// A frame a driver would accept: one draw, inside a pass, with a
+// pipeline set.
+fn a_legal_list() -> GpuCommandList
+    gpucmd.extend(gpucmd.list("frame"),
+                  gpucmd.render_pass(GpuViewId { handle: 1 }, 0.0, 0.0, 0.0, 1.0,
+                                     [GpuSetPipeline(pipeline: GpuPipelineId { handle: 5 }),
+                                      GpuDraw(vertex_count: 6, instance_count: 1)]))
+
+// A frame no driver should be given: a draw outside any pass.
+fn an_illegal_list() -> GpuCommandList
+    gpucmd.push(gpucmd.list("frame"), GpuDraw(vertex_count: 6, instance_count: 1))
+
+// A store program a driver would accept.
+fn a_shader_source() -> Str
+    "@group(0) @binding(0) var s: sampler;\n@vertex fn vs_main() {}\n@fragment fn fs_main() {}\n"
+
+impl GpuDriver for Recorder
+    fn adapters(var self) -> Result<[GpuAdapterInfo], GpuFault> [io]
+        list.push(self.calls, "adapters")
+        Ok(self.adapters[:])
+
+    fn open_device(var self, adapter: GpuAdapterInfo) -> Result<GpuOpenDevice, GpuFault> [io, time]
+        list.push(self.calls, "open_device:${adapter.name}")
+        if self.refuses == "open_device"
+            Err(GpuNoAdapter)
+        else
+            Ok(GpuOpenDevice { device: GpuDeviceId { handle: 0 },
+                               queue: GpuQueueId { handle: 0 },
+                               limits: gpures.baseline_limits(),
+                               adapter: adapter })
+
+    fn create_buffer(var self, device: GpuDeviceId,
+                     d: GpuBufferDesc) -> Result<GpuBufferId, GpuFault> [io]
+        list.push(self.calls, "create_buffer:${usage_name(d.usage)}")
+        if self.refuses == "read_pair" and d.usage.map_read
+            Err(GpuDeviceLost(reason: "out of memory"))
+        elif self.refuses == "create_buffer"
+            Err(GpuBadUsage(detail: "no buffer"))
+        elif d.usage.storage
+            Ok(GpuBufferId { handle: 1 })
+        else
+            Ok(GpuBufferId { handle: 2 })
+
+    fn create_texture(var self, device: GpuDeviceId,
+                      d: GpuTextureDesc) -> Result<GpuTextureView, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_sampler(var self, device: GpuDeviceId,
+                      d: GpuSamplerDesc) -> Result<GpuSamplerId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_shader(var self, device: GpuDeviceId,
+                     d: GpuShaderDesc) -> Result<GpuShaderId, GpuFault> [io]
+        list.push(self.calls, "create_shader")
+        if self.refuses == "create_shader"
+            Err(GpuDeviceLost(reason: "the compiler fell over"))
+        else
+            Ok(GpuShaderId { handle: 11 })
+
+    fn create_render_pipeline(var self, device: GpuDeviceId,
+                              d: GpuRenderPipelineDesc) -> Result<GpuPipelineId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_compute_pipeline(var self, device: GpuDeviceId,
+                               d: GpuComputePipelineDesc) -> Result<GpuPipelineId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_layout(var self, device: GpuDeviceId,
+                     d: GpuLayoutDesc) -> Result<GpuLayoutId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn create_bind_group(var self, device: GpuDeviceId,
+                         d: GpuBindGroupDesc) -> Result<GpuBindGroupId, GpuFault> [io]
+        Err(GpuNoAdapter)
+
+    fn submit(var self, queue: GpuQueueId,
+              l: GpuCommandList) -> Result<GpuSubmission, GpuFault> [io, time]
+        list.push(self.calls, "submit")
+        if self.refuses == "submit"
+            Err(GpuDeviceLost(reason: "device removed"))
+        else
+            Ok(GpuSubmission { handle: 42 })
+
+    fn read_buffer(var self, device: GpuDeviceId, s: GpuSubmission, b: GpuBufferId,
+                   size_bytes: Int) -> Result<Bytes, GpuFault> [io, time]
+        list.push(self.calls, "read_buffer:${b.handle}:${size_bytes}")
+        if self.refuses == "read_buffer"
+            Err(GpuDeviceLost(reason: "unplugged"))
+        else
+            Ok(bytes.from_str(self.payload))
+
+    fn release(var self, device: GpuDeviceId, r: GpuResource) -> Result<Unit, GpuFault> [io]
+        list.push(self.calls, resource_label(r))
+        if self.refuses == "release"
+            Err(GpuBadUsage(detail: "release refused"))
+        elif self.refuses == "release_pipeline" and release_rank(r) == 1
+            Err(GpuDeviceLost(reason: "the pipeline would not go"))
+        else
+            Ok()
+
+fn seen(r: Recorder) -> Str
+    list.join(r.calls, " ")
+
+@test
+fn test_open_best_opens_the_adapter_the_rule_picks() [io, time]
+    test.case("a machine with a real GPU opens it, and the software rasteriser is not asked twice")
+    let r = a_recorder([an_adapter("llvmpipe", GpuCpu), an_adapter("intel", GpuIntegrated),
+                        an_adapter("nvidia", GpuDiscrete)])
+    match gpudriver.open_best(r, false)
+        Err(_)  => test.assert(false)
+        Ok(dev) =>
+            test.assert_eq_str(dev.adapter.name, "nvidia")
+            test.assert_eq_str(seen(r), "adapters open_device:nvidia")
+
+    test.case("a machine whose only rasteriser is software has no adapter, unless it asked for one")
+    let s = a_recorder([an_adapter("llvmpipe", GpuCpu)])
+    match gpudriver.open_best(s, false)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert_eq_str(f.message(), "gpu-nv: no adapter this backend can see")
+            test.assert_eq_str(seen(s), "adapters")
+
+    test.case("and one that asked for it gets it, because a headless build is a real answer")
+    let t = a_recorder([an_adapter("llvmpipe", GpuCpu)])
+    match gpudriver.open_best(t, true)
+        Err(_)  => test.assert(false)
+        Ok(dev) =>
+            test.assert_eq_str(dev.adapter.name, "llvmpipe")
+            test.assert_eq_str(seen(t), "adapters open_device:llvmpipe")
+
+    test.case("asking for software is permission, not preference: a real GPU still wins")
+    let p = a_recorder([an_adapter("llvmpipe", GpuCpu), an_adapter("nvidia", GpuDiscrete)])
+    match gpudriver.open_best(p, true)
+        Err(_)  => test.assert(false)
+        Ok(dev) => test.assert_eq_str(dev.adapter.name, "nvidia")
+
+    test.case("an adapter the driver cannot open is the fault that travels")
+    let u = a_refuser([an_adapter("nvidia", GpuDiscrete)], "open_device")
+    match gpudriver.open_best(u, false)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert_eq_str(f.message(), "gpu-nv: no adapter this backend can see")
+            test.assert_eq_str(seen(u), "adapters open_device:nvidia")
+
+@test
+fn test_validate_and_submit_checks_before_the_driver_is_given_anything() [io, time]
+    test.case("a legal frame is sent, and the submission comes back")
+    let r = a_recorder([])
+    match gpudriver.validate_and_submit(r, a_device(), a_legal_list())
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.assert_eq(s.handle, 42)
+            test.assert_eq_str(seen(r), "submit")
+
+    test.case("an illegal frame never reaches the driver, and the fault names the command")
+    let d = a_recorder([])
+    match gpudriver.validate_and_submit(d, a_device(), an_illegal_list())
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert_eq_str(f.message(),
+                               "gpu-nv: the command list is not a legal submission: "
+                               + "gpu-nv: command 0 is outside any pass")
+            test.assert_eq_str(seen(d), "")
+
+    test.case("the FIRST fault is the one the caller reads, in the list's own order")
+    let two = gpucmd.extend(gpucmd.list("frame"),
+                            [GpuDraw(vertex_count: 3, instance_count: 1),
+                             GpuDraw(vertex_count: 3, instance_count: 1)])
+    let e = a_recorder([])
+    match gpudriver.validate_and_submit(e, a_device(), two)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert(str.contains(f.message(), "command 0 is outside any pass"))
+            test.assert_eq_str(seen(e), "")
+
+    test.case("a driver that refuses the submission is answered, not retried")
+    let s = a_refuser([], "submit")
+    match gpudriver.validate_and_submit(s, a_device(), a_legal_list())
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert_eq_str(f.message(), "gpu-nv: the device was lost: device removed")
+            test.assert_eq_str(seen(s), "submit")
+
+@test
+fn test_submit_and_read_waits_for_the_submission_it_made() [io, time]
+    test.case("the bytes come back, and the read names the buffer it read")
+    let r = a_recorder([])
+    let answer = gpudriver.submit_and_read(r, a_device(), a_legal_list(), a_readback(), 4)
+    match answer
+        Err(_) => test.assert(false)
+        Ok(b)  =>
+            test.assert_eq(bytes.len(b), 0)
+            test.assert_eq_str(seen(r), "submit read_buffer:2:4")
+
+    test.case("and a refusal to read is answered rather than swallowed")
+    let s = a_refuser([], "read_buffer")
+    match gpudriver.submit_and_read(s, a_device(), a_legal_list(), a_readback(), 4)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert_eq_str(f.message(), "gpu-nv: the device was lost: unplugged")
+            test.assert_eq_str(seen(s), "submit read_buffer:2:4")
+
+    test.case("an illegal list is refused before the driver is asked to send it")
+    let d = a_recorder([])
+    match gpudriver.submit_and_read(d, a_device(), an_illegal_list(), a_readback(), 4)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert_eq_str(seen(d), "")
+
+@test
+fn test_create_checked_shader_checks_before_the_driver_compiles() [io, time]
+    test.case("the entry points exist, so the driver compiles it")
+    let r = a_recorder([])
+    match gpudriver.create_checked_shader(r, a_device(), gpushader.shader("s", a_shader_source()),
+                                          ["vs_main", "fs_main"])
+        Err(_) => test.assert(false)
+        Ok(id) =>
+            test.assert_eq(id.handle, 11)
+            test.assert_eq_str(seen(r), "create_shader")
+
+    test.case("a typo is caught here, the driver is never asked, and the fault names it")
+    let d = a_recorder([])
+    match gpudriver.create_checked_shader(d, a_device(), gpushader.shader("s", a_shader_source()),
+                                          ["vs_main", "fs_mian"])
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert_eq_str(f.message(), "gpu-nv: the shader did not compile: "
+                                            + "the shader declares no entry point named fs_mian")
+            test.assert_eq_str(seen(d), "")
+
+    test.case("a name that only begins with the entry point's is a different function")
+    let c = a_recorder([])
+    match gpudriver.create_checked_shader(c, a_device(),
+                                          gpushader.shader("s", "fn vs_main_extra() {}\n"),
+                                          ["vs_main"])
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert(str.contains(f.message(), "no entry point named vs_main"))
+            test.assert_eq_str(seen(c), "")
+
+    test.case("and a driver that refuses to compile is answered")
+    let s = a_refuser([], "create_shader")
+    match gpudriver.create_checked_shader(s, a_device(), gpushader.shader("s", a_shader_source()),
+                                          ["vs_main"])
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert_eq_str(f.message(), "gpu-nv: the device was lost: the compiler fell over")
+            test.assert_eq_str(seen(s), "create_shader")
+
+@test
+fn test_create_readback_pair_never_hands_back_half_a_pair() [io, time]
+    test.case("one buffer a shader writes and one the host reads")
+    let r = a_recorder([])
+    match gpudriver.create_readback_pair(r, a_device(), "result", 256)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert_eq(p.storage.handle, 1)
+            test.assert_eq(p.readback.handle, 2)
+            test.assert_eq_str(seen(r), "create_buffer:storage create_buffer:read")
+
+    test.case("and when the second one cannot be made, the first goes back")
+    let d = a_refuser([], "read_pair")
+    match gpudriver.create_readback_pair(d, a_device(), "result", 256)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert_eq_str(f.message(), "gpu-nv: the device was lost: out of memory")
+            test.assert_eq_str(seen(d),
+                               "create_buffer:storage create_buffer:read release:buffer:1")
+
+    test.case("the fault that travels is the one that stopped the pair, not the release")
+    let both = a_refuser([], "read_pair")
+    match gpudriver.create_readback_pair(both, a_device(), "result", 256)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(not str.contains(f.message(), "release refused"))
+
+    test.case("and a first buffer that cannot be made is not released, because there is none")
+    let first = a_refuser([], "create_buffer")
+    match gpudriver.create_readback_pair(first, a_device(), "result", 256)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert_eq_str(f.message(), "gpu-nv: the backend refuses this usage: no buffer")
+            test.assert_eq_str(seen(first), "create_buffer:storage")
+
+@test
+fn test_release_all_releases_in_rank_order_and_stops_at_the_first_fault() [io]
+    test.case("releasing nothing is not a failure, and not a call")
+    let none = a_recorder([])
+    match gpudriver.release_all(none, a_device(), [])
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert_eq_str(seen(none), "")
+
+    test.case("a caller's list goes back in the order a backend allows, not the order it was built")
+    let r = a_recorder([])
+    let unsorted = [GpuReleaseBuffer(id: GpuBufferId { handle: 9 }),
+                    GpuReleaseLayout(id: GpuLayoutId { handle: 3 }),
+                    GpuReleaseBindGroup(id: GpuBindGroupId { handle: 1 }),
+                    GpuReleasePipeline(id: GpuPipelineId { handle: 2 })]
+    match gpudriver.release_all(r, a_device(), unsorted)
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert_eq_str(seen(r),
+                                     "release:bindgroup:1 release:pipeline:2 "
+                                     + "release:layout:3 release:buffer:9")
+
+    test.case("and the caller's own list is left as it was, because it is a value")
+    test.assert_eq(list.len(unsorted), 4)
+    test.assert_eq(unsorted[0], GpuReleaseBuffer(id: GpuBufferId { handle: 9 }))
+
+    test.case("a fault stops the teardown where it happened, and is answered")
+    let s = a_refuser([], "release_pipeline")
+    match gpudriver.release_all(s, a_device(), unsorted)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert_eq_str(f.message(), "gpu-nv: the device was lost: the pipeline would not go")
+            test.assert_eq_str(seen(s), "release:bindgroup:1 release:pipeline:2")
+
+    test.case("a backend that refuses every release answers the first refusal")
+    let all = a_refuser([], "release")
+    match gpudriver.release_all(all, a_device(), unsorted)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert_eq_str(f.message(), "gpu-nv: the backend refuses this usage: release refused")
+            test.assert_eq_str(seen(all), "release:bindgroup:1")
+
+@test
+fn test_every_resource_has_its_own_rank() [io]
+    // The order is the whole content of `release_rank`, and nine arms of
+    // it are nine chances to write the same number twice.
+    let ranks = [gpudriver.release_rank(GpuReleaseBindGroup(id: GpuBindGroupId { handle: 1 })),
+                 gpudriver.release_rank(GpuReleasePipeline(id: GpuPipelineId { handle: 1 })),
+                 gpudriver.release_rank(GpuReleaseShader(id: GpuShaderId { handle: 1 })),
+                 gpudriver.release_rank(GpuReleaseLayout(id: GpuLayoutId { handle: 1 })),
+                 gpudriver.release_rank(GpuReleaseView(id: GpuViewId { handle: 1 })),
+                 gpudriver.release_rank(GpuReleaseTexture(id: GpuTextureId { handle: 1 })),
+                 gpudriver.release_rank(GpuReleaseSampler(id: GpuSamplerId { handle: 1 })),
+                 gpudriver.release_rank(GpuReleaseBuffer(id: GpuBufferId { handle: 1 })),
+                 gpudriver.release_rank(GpuReleaseDevice(id: GpuDeviceId { handle: 1 }))]
+
+    test.case("nine kinds, nine ranks, strictly increasing")
+    let increasing = list.all(list.range(1, list.len(ranks)), i => ranks[i - 1] < ranks[i])
+    test.assert(increasing)
+
+    test.case("a bind group outlives nothing, and a device outlives everything")
+    test.assert_eq(list.min(ranks)!, ranks[0])
+    test.assert_eq(list.max(ranks)!, ranks[8])
+
+@test
+fn test_only_a_lost_device_needs_every_resource_remade() [io]
+    test.case("a lost device invalidates every handle the driver allocated")
+    test.assert(gpudriver.needs_recreate(GpuDeviceLost(reason: "suspended")))
+    test.assert(gpudriver.needs_recreate(GpuDeviceLost(reason: "")))
+
+    test.case("a submission that was merely refused is retried against the same handles")
+    test.assert(not gpudriver.needs_recreate(GpuBadCommandList(detail: "a pass left open")))
+    test.assert(not gpudriver.needs_recreate(GpuNoAdapter))
+    test.assert(not gpudriver.needs_recreate(GpuBadUsage(detail: "storage and map_read")))
+    test.assert(not gpudriver.needs_recreate(GpuOverLimit(limit: "max_buffer_bytes",
+                                                          asked: 4096, allowed: 1024)))
+    test.assert(not gpudriver.needs_recreate(GpuDriverError(code: 7, message: "internal")))

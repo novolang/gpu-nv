@@ -1,8 +1,6 @@
 // gpushader.nv — the shader is text the caller supplies, and the
 // layout is a value.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE SHADER IS WGSL AND THIS PACKAGE DOES NOT PARSE IT.  A caller
 // supplies the source; the driver compiles it and answers a diagnostic
 // this package passes through whole.  Writing a WGSL front end here
@@ -27,6 +25,10 @@
 // silently unbound stage on others.  `has_entry_point` is the scan.
 //
 // NOTHING HERE PERFORMS ANYTHING.  Every row in this module is `[]`.
+
+use std.list
+use std.str
+use gpures
 
 // A shader module's source, and what to call it.
 pub struct GpuShaderDesc
@@ -147,7 +149,7 @@ pub struct GpuComputePipelineDesc
 //     println("a shader, as text")
 // ```
 pub fn shader(label: Str, wgsl: Str) -> GpuShaderDesc []
-    todo("gpu-nv.gpushader.shader")
+    GpuShaderDesc { label: label, wgsl: wgsl }
 
 // The stages a binding is visible to.
 //
@@ -161,7 +163,7 @@ pub fn shader(label: Str, wgsl: Str) -> GpuShaderDesc []
 //     println("visible to the vertex and fragment stages")
 // ```
 pub fn stages(vertex: Bool, fragment: Bool, compute: Bool) -> GpuStages []
-    todo("gpu-nv.gpushader.stages")
+    GpuStages { vertex: vertex, fragment: fragment, compute: compute }
 
 // A bind group layout.
 //
@@ -175,7 +177,7 @@ pub fn stages(vertex: Bool, fragment: Bool, compute: Bool) -> GpuStages []
 //     println("one bind group's shape")
 // ```
 pub fn layout(label: Str, group: Int, bindings: [GpuBindingDesc]) -> GpuLayoutDesc []
-    todo("gpu-nv.gpushader.layout")
+    GpuLayoutDesc { label: label, group: group, bindings: bindings }
 
 // The sampler-and-texture layout a textured quad needs.
 //
@@ -194,7 +196,157 @@ pub fn layout(label: Str, group: Int, bindings: [GpuBindingDesc]) -> GpuLayoutDe
 //     println("the layout a textured quad wants")
 // ```
 pub fn sampler_texture_layout(label: Str, group: Int) -> GpuLayoutDesc []
-    todo("gpu-nv.gpushader.sampler_texture_layout")
+    GpuLayoutDesc {
+        label: label,
+        group: group,
+        bindings: [
+            GpuBindingDesc { binding: 0, kind: GpuSampler,
+                             stages: stages(false, true, false) },
+            GpuBindingDesc { binding: 1, kind: GpuSampledTexture,
+                             stages: stages(false, true, false) }] }
+
+// One binding a source declares, with the group it is in.
+//
+// `GpuBindingDesc` carries no group — a layout holds the group number
+// and the bindings inside it — so the scan keeps the two together until
+// the comparison, and `bindings_of_wgsl` drops this wrapper on the way
+// out.
+struct DeclaredBinding
+    group: Int
+    desc: GpuBindingDesc
+
+// The stages a declaration with no stage of its own is taken to be
+// visible to.
+//
+// A module-scope `var` is visible to a stage that uses it and this scan
+// cannot see which ones do, so the answer is every stage: a layout built
+// from it is permissive, where one built with no stage set would bind
+// nothing and draw nothing.  `layouts_agree` does not compare stages for
+// the same reason.
+fn all_stages() -> GpuStages
+    GpuStages { vertex: true, fragment: true, compute: true }
+
+// The integer between the `(` after `at` and the `)` that closes it, or
+// -1 when either is missing or the text is not a number.
+fn paren_number(text: Str, at: Int) -> Int
+    match str.index_from(text, "(", at)
+        None       => -1
+        Some(open) =>
+            match str.index_from(text, ")", open)
+                None        => -1
+                Some(close) => str.to_int(str.trim(str.slice(text, open + 1, close))) ?? -1
+
+// The text between `var<` and `>`, or "" when the declaration writes no
+// address space.
+fn address_space(decl: Str) -> Str
+    let at = str.index(decl, "var<") ?? -1
+    if at < 0
+        ""
+    else
+        match str.index_from(decl, ">", at)
+            None        => ""
+            Some(close) => str.trim(str.slice(decl, at + 4, close))
+
+// The type a `var` declaration names: the text after its first colon
+// past the keyword.
+fn type_name(decl: Str) -> Str
+    let at = str.index(decl, "var") ?? -1
+    if at < 0
+        // cov: skip — unreachable through this module's only caller: `declared_binding` answers `None` to a declaration with no `var` before it calls `kind_in`, and `kind_in` is the one place that calls this
+        ""
+    else
+        match str.index_from(decl, ":", at)
+            None        => ""
+            Some(colon) => str.trim(str.slice(decl, colon + 1, str.len(decl)))
+
+// The format a storage-texture type names.
+//
+// `texture_storage_2d<rgba8unorm, write>` is the form: the format is
+// the first argument.  A format this package does not name travels as
+// `GpuFormatOther` with code 0, which is also what an unread one is —
+// see `gpures.format_bytes`.
+fn format_of(t: Str) -> GpuTextureFormat
+    if str.contains(t, "rgba8unorm-srgb")
+        GpuRgba8UnormSrgb
+    elif str.contains(t, "rgba8unorm")
+        GpuRgba8Unorm
+    elif str.contains(t, "bgra8unorm")
+        GpuBgra8Unorm
+    elif str.contains(t, "rgba32float")
+        GpuRgba32Float
+    else
+        GpuFormatOther(code: 0)
+
+// The kind a WGSL type names, for the declarations that write no
+// address space — the handle types, whose kind is the type.
+fn kind_of_type(t: Str) -> ?GpuBindingKind
+    if str.starts_with(t, "sampler")
+        Some(GpuSampler)
+    elif str.starts_with(t, "texture_storage")
+        Some(GpuStorageTexture(format: format_of(t)))
+    elif str.starts_with(t, "texture_")
+        Some(GpuSampledTexture)
+    else
+        None
+
+// The kind one `var` declaration binds, or `None` when the scan cannot
+// tell.
+//
+// The address space decides for the two buffer kinds, because
+// `var<uniform> u: Uniforms` names its kind in the `<>` and not in the
+// type; the type decides for the handle kinds, which carry none.
+//
+// A minimum size is 0 and stays 0: the size of a uniform buffer is in
+// the struct the type names, or in the array length inside it, and
+// reading it is a parse of the language rather than a scan of it.
+fn kind_in(decl: Str) -> ?GpuBindingKind
+    let space = address_space(decl)
+    if str.contains(space, "uniform")
+        Some(GpuUniformBuffer(min_bytes: 0))
+    elif str.contains(space, "read_write")
+        Some(GpuReadWriteStorageBuffer(min_bytes: 0))
+    elif str.contains(space, "storage")
+        Some(GpuReadStorageBuffer(min_bytes: 0))
+    else
+        kind_of_type(type_name(decl))
+
+// One binding, read from a single `;`-delimited declaration, or `None`
+// when the declaration is not a binding this scan can read.
+//
+// Splitting the source on `;` is what makes this a scan: every WGSL
+// module-scope declaration but a function ends at one, so a declaration
+// is one string and the reads inside it need no position arithmetic
+// across the whole source.
+fn declared_binding(decl: Str) -> ?DeclaredBinding
+    let at_group = str.index(decl, "@group") ?? -1
+    let at_binding = str.index(decl, "@binding") ?? -1
+    if at_group < 0 or at_binding < 0
+        None
+    elif not str.contains(decl, "var")
+        None
+    else
+        let group = paren_number(decl, at_group)
+        let binding = paren_number(decl, at_binding)
+        if group < 0 or binding < 0
+            None
+        else
+            match kind_in(decl)
+                None       => None
+                Some(kind) =>
+                    Some(DeclaredBinding {
+                        group: group,
+                        desc: GpuBindingDesc { binding: binding, kind: kind,
+                                               stages: all_stages() } })
+
+// Every binding a source declares, in the order it declares them.
+fn scan_declared(wgsl: Str) -> [DeclaredBinding]
+    var out: [DeclaredBinding] = []
+    for decl in str.split(wgsl, ";")
+        match declared_binding(decl)
+            None    => ()
+            Some(d) =>
+                out = list.push(out, d)
+    out
 
 // What a WGSL source declares it will be bound.
 //
@@ -214,7 +366,82 @@ pub fn sampler_texture_layout(label: Str, group: Int) -> GpuLayoutDesc []
 //     println("what a shader says it needs")
 // ```
 pub fn bindings_of_wgsl(wgsl: Str) -> [GpuBindingDesc] []
-    todo("gpu-nv.gpushader.bindings_of_wgsl")
+    list.map(scan_declared(wgsl), d => d.desc)
+
+// Is this the format a scan answers when it did not read one?
+fn is_unknown_format(f: GpuTextureFormat) -> Bool
+    match f
+        GpuFormatOther(code) => code == 0
+        _                    => false
+
+// What a binding kind is, as a sentence a report can carry.
+fn kind_name(k: GpuBindingKind) -> Str
+    match k
+        GpuUniformBuffer(_)          => "a uniform buffer"
+        GpuReadStorageBuffer(_)      => "a read-only storage buffer"
+        GpuReadWriteStorageBuffer(_) => "a read-write storage buffer"
+        GpuSampledTexture            => "a sampled texture"
+        GpuSampler                   => "a sampler"
+        GpuStorageTexture(_)         => "a storage texture"
+
+// Do two storage-texture formats agree?
+//
+// A format a scan did not read is not the claim that it read a different
+// one, so an unread format on either side is not a disagreement.
+fn formats_agree(a: GpuTextureFormat, b: GpuTextureFormat) -> Bool
+    if is_unknown_format(a) or is_unknown_format(b)
+        true
+    else
+        a == b
+
+// Do two kinds describe the same binding?
+//
+// The kinds have to be the same one, and for a storage texture the two
+// formats have to be the same as well — a layout that binds an
+// `rgba8unorm` storage texture to a shader that writes `rgba32float` is
+// a disagreement about bytes, not about kind.
+fn kinds_agree(layout: GpuBindingKind, declared: GpuBindingKind) -> Bool
+    match layout
+        GpuStorageTexture(f) =>
+            match declared
+                GpuStorageTexture(g) => formats_agree(f, g)
+                _                    => false
+        _                    => kind_name(layout) == kind_name(declared)
+
+// The binding a source declares under this number in this group, or
+// `None`.
+fn declared_in_group(declared: [DeclaredBinding], group: Int, binding: Int) -> ?GpuBindingDesc
+    match list.find(declared, d => d.group == group and d.desc.binding == binding)
+        None    => None
+        Some(d) => Some(d.desc)
+
+// Does this layout bind this number?
+fn layout_binds(bindings: [GpuBindingDesc], binding: Int) -> Bool
+    list.any(bindings, b => b.binding == binding)
+
+// What a layout binds that the source does not, or binds as something
+// else.
+fn layout_disagreements(l: GpuLayoutDesc, declared: [DeclaredBinding]) -> [Str]
+    var out: [Str] = []
+    for b in l.bindings
+        match declared_in_group(declared, l.group, b.binding)
+            None    =>
+                out = list.push(out,
+                    "gpushader: group ${l.group} binds ${b.binding} and the shader declares nothing there")
+            Some(d) =>
+                if not kinds_agree(b.kind, d.kind)
+                    out = list.push(out,
+                        "gpushader: binding ${b.binding} of group ${l.group} is ${kind_name(b.kind)} in the layout and ${kind_name(d.kind)} in the shader")
+    out
+
+// What the source declares in this group that the layout does not bind.
+fn shader_disagreements(l: GpuLayoutDesc, declared: [DeclaredBinding]) -> [Str]
+    var out: [Str] = []
+    for d in declared
+        if d.group == l.group and not layout_binds(l.bindings, d.desc.binding)
+            out = list.push(out,
+                "gpushader: group ${d.group} declares binding ${d.desc.binding} and the layout does not bind it")
+    out
 
 // Do a layout and what a shader declares agree?
 //
@@ -237,7 +464,76 @@ pub fn bindings_of_wgsl(wgsl: Str) -> [GpuBindingDesc] []
 //     println("whether a layout matches its shader")
 // ```
 pub fn layouts_agree(l: GpuLayoutDesc, wgsl: Str) -> [Str] []
-    todo("gpu-nv.gpushader.layouts_agree")
+    let declared = scan_declared(wgsl)
+    if list.len(declared) == 0
+        []
+    else
+        let missing = layout_disagreements(l, declared)
+        let extra = shader_disagreements(l, declared)
+        list.concat(missing, extra)
+
+// Is this byte one an identifier may continue with?
+//
+// The scan has to tell `main` from `main_loop` and `vs_main` from
+// `vs_mian`, and that is a question about the byte after the name.
+fn is_ident_byte(b: Int) -> Bool
+    b >= 'a' and b <= 'z' or b >= 'A' and b <= 'Z' or b >= '0' and b <= '9'
+        or b == '_'
+
+// The first byte at or after `i` that is not a space or a line break.
+//
+// A WGSL declaration may put any amount of whitespace between `fn`, the
+// name and the parameter list, so every read that follows a keyword
+// starts here.
+fn skip_spaces(s: Str, i: Int) -> Int
+    var k = i
+    var moving = true
+    while moving
+        let b = str.byte_at_or(s, k, -1)
+        if b == ' ' or b == '\t' or b == '\n' or b == '\r'
+            k += 1
+        else
+            moving = false
+    k
+
+// Is the `fn` at this offset the declaration of this name?
+//
+// `at` is the offset of the `fn` itself, and the name has to start
+// after the whitespace that follows it and stop at a byte that could
+// not continue an identifier — so a name that is a prefix of another
+// name does not answer.
+fn declares_name(wgsl: Str, at: Int, name: Str) -> Bool
+    let start = skip_spaces(wgsl, at + 2)
+    let end = start + str.len(name)
+    if end > str.len(wgsl)
+        false
+    else
+        not is_ident_byte(str.byte_at_or(wgsl, end, ' '))
+            and str.slice(wgsl, start, end) == name
+
+// The byte offset of a `fn <name>` declaration, or -1.
+//
+// This reads a declaration and does not parse the language: a source it
+// cannot read answers -1 rather than a wrong offset, and the callers
+// that publish this say so.
+fn fn_offset(wgsl: Str, name: Str) -> Int
+    if str.is_empty(name)
+        -1
+    else
+        var from = 0
+        var answer = -1
+        var searching = true
+        while searching
+            match str.index_from(wgsl, "fn", from)
+                None    =>
+                    searching = false
+                Some(k) =>
+                    if declares_name(wgsl, k, name)
+                        answer = k
+                        searching = false
+                    else
+                        from = k + 2
+        answer
 
 // Does this source declare a function with this name?
 //
@@ -254,7 +550,106 @@ pub fn layouts_agree(l: GpuLayoutDesc, wgsl: Str) -> [Str] []
 //     println("whether a shader has the entry point a pipeline names")
 // ```
 pub fn has_entry_point(wgsl: Str, name: Str) -> Bool []
-    todo("gpu-nv.gpushader.has_entry_point")
+    fn_offset(wgsl, name) >= 0
+
+// The attribute a compute entry point's size is written in.
+//
+// A named constant because the scan both searches for it and skips past
+// it, and one string cannot disagree with itself about its own length.
+const WORKGROUP_SIZE_ATTR: Str = "@workgroup_size"
+
+// Component `i` of a parsed size, or 1.
+//
+// One argument to `@workgroup_size` is x with y and z at 1, which is
+// the default WGSL gives them, and a component that was not written is
+// therefore not a zero.
+fn component_or(cs: [Int], i: Int) -> Int
+    if i < list.len(cs)
+        list.get(cs, i)
+    else
+        1
+
+// The size three parsed components make, or `None` when they are not
+// one.
+//
+// The count is checked here rather than at the call because a WGSL
+// attribute takes one, two or three arguments and a fourth is a source
+// this scan does not model.
+fn size_from_components(cs: [Int]) -> ?GpuWorkgroupSize
+    let count = list.len(cs)
+    if count < 1 or count > 3
+        None
+    else
+        let x = list.get(cs, 0)
+        let y = component_or(cs, 1)
+        let z = component_or(cs, 2)
+        if x < 1 or y < 1 or z < 1
+            None
+        else
+            Some(GpuWorkgroupSize { x: x, y: y, z: z })
+
+// The size the `@workgroup_size` attribute at this offset declares.
+//
+// `None` when the text after the name is not a parenthesised list of
+// integers, which is what a declaration this scan cannot read looks
+// like.
+fn size_at(text: Str, at: Int) -> ?GpuWorkgroupSize
+    let open = skip_spaces(text, at + str.len(WORKGROUP_SIZE_ATTR))
+    if str.byte_at_or(text, open, -1) != '('
+        None
+    else
+        match str.index_from(text, ")", open)
+            None        => None
+            Some(close) =>
+                let arguments = str.slice(text, open + 1, close)
+                let components = list.map(str.split(arguments, ","),
+                                           p => str.to_int(str.trim(p)) ?? -1)
+                size_from_components(components)
+
+// The last size this text declares, or `None` when it declares none.
+//
+// The last rather than the first: the text is one declaration's
+// attribute list, and a declaration that carries two of these is one
+// the compiler will refuse anyway — reading the later one keeps the
+// scan out of the business of choosing which of two mistakes is the
+// real one.
+fn parse_workgroup_size(text: Str) -> ?GpuWorkgroupSize
+    var from = 0
+    var answer: ?GpuWorkgroupSize = None
+    var searching = true
+    while searching
+        match str.index_from(text, WORKGROUP_SIZE_ATTR, from)
+            None    =>
+                searching = false
+            Some(k) =>
+                answer = size_at(text, k)
+                from = k + str.len(WORKGROUP_SIZE_ATTR)
+    answer
+
+// Where the attribute list of the declaration at `at` begins.
+//
+// A WGSL function's attributes sit between the previous declaration's
+// closing brace and the `fn` keyword, so the text between the two is
+// the whole of what may describe this entry point — which is what stops
+// one function's `@workgroup_size` from being read as the next one's.
+fn attribute_window(wgsl: Str, at: Int) -> Int
+    var k = at
+    var start = 0
+    var moving = true
+    while moving and k > 0
+        k -= 1
+        if str.byte_at_or(wgsl, k, -1) == '}'
+            start = k + 1
+            moving = false
+    start
+
+// The workgroup size a named entry point declares, or `None`.
+fn declared_workgroup_size(wgsl: Str, entry: Str) -> ?GpuWorkgroupSize
+    let at = fn_offset(wgsl, entry)
+    if at < 0
+        None
+    else
+        parse_workgroup_size(str.slice(wgsl, attribute_window(wgsl, at), at))
 
 // The workgroup size a compute entry point declares.
 //
@@ -275,7 +670,7 @@ pub fn has_entry_point(wgsl: Str, name: Str) -> Bool []
 //     println("the workgroup size a shader declares")
 // ```
 pub fn workgroup_size_of(wgsl: Str, entry: Str) -> ?GpuWorkgroupSize []
-    todo("gpu-nv.gpushader.workgroup_size_of")
+    declared_workgroup_size(wgsl, entry)
 
 // A compute entry point's declared workgroup size.
 pub struct GpuWorkgroupSize
@@ -296,7 +691,8 @@ pub struct GpuWorkgroupSize
 // ```
 pub fn vertex_buffer(stride_bytes: Int, per_instance: Bool,
                      attributes: [GpuVertexAttribute]) -> GpuVertexBufferDesc []
-    todo("gpu-nv.gpushader.vertex_buffer")
+    GpuVertexBufferDesc { stride_bytes: stride_bytes, per_instance: per_instance,
+                          attributes: attributes }
 
 // One vertex attribute.
 //
@@ -310,7 +706,7 @@ pub fn vertex_buffer(stride_bytes: Int, per_instance: Bool,
 //     println("a position at location zero")
 // ```
 pub fn attribute(location: Int, offset_bytes: Int, floats: Int) -> GpuVertexAttribute []
-    todo("gpu-nv.gpushader.attribute")
+    GpuVertexAttribute { location: location, offset_bytes: offset_bytes, floats: floats }
 
 // Does this vertex layout's stride hold its attributes?
 //
@@ -328,7 +724,7 @@ pub fn attribute(location: Int, offset_bytes: Int, floats: Int) -> GpuVertexAttr
 //     println("whether a stride holds what it says it holds")
 // ```
 pub fn stride_fits(v: GpuVertexBufferDesc) -> Bool []
-    todo("gpu-nv.gpushader.stride_fits")
+    v.stride_bytes >= required_stride(v.attributes)
 
 // The stride these attributes actually need.
 //
@@ -342,7 +738,16 @@ pub fn stride_fits(v: GpuVertexBufferDesc) -> Bool []
 //     println("${gpushader.required_stride([])}")
 // ```
 pub fn required_stride(attributes: [GpuVertexAttribute]) -> Int []
-    todo("gpu-nv.gpushader.required_stride")
+    // Four bytes a float, because `floats` counts 32-bit ones.  The
+    // number is a maximum and not a sum: two attributes that overlap are
+    // a mistake the caller can see in the offsets, and a sum would call
+    // that mistake a stride.
+    var needed = 0
+    for a in attributes
+        let end = a.offset_bytes + a.floats * 4
+        if end > needed
+            needed = end
+    needed
 
 // A render pipeline description.
 //
@@ -358,7 +763,20 @@ pub fn required_stride(attributes: [GpuVertexAttribute]) -> Int []
 // ```
 pub fn render_pipeline(label: Str, shader: GpuShaderId, vertex_entry: Str, fragment_entry: Str,
                        target_format: GpuTextureFormat) -> GpuRenderPipelineDesc []
-    todo("gpu-nv.gpushader.render_pipeline")
+    // Alpha blending on, because the shape this describes is a textured
+    // quad over a background and that is the case the flag exists for.
+    // The vertex buffers and the layouts start empty: a pipeline that
+    // needs either writes its own literal, and a default that guessed
+    // one would be a second source of truth for a layout.
+    GpuRenderPipelineDesc {
+        label: label,
+        shader: shader,
+        vertex_entry: vertex_entry,
+        fragment_entry: fragment_entry,
+        target_format: target_format,
+        vertex_buffers: [],
+        layouts: [],
+        alpha_blend: true }
 
 // A compute pipeline description.
 //
@@ -373,7 +791,7 @@ pub fn render_pipeline(label: Str, shader: GpuShaderId, vertex_entry: Str, fragm
 //     println("a compute pipeline, described")
 // ```
 pub fn compute_pipeline(label: Str, shader: GpuShaderId, entry: Str) -> GpuComputePipelineDesc []
-    todo("gpu-nv.gpushader.compute_pipeline")
+    GpuComputePipelineDesc { label: label, shader: shader, entry: entry }
 
 // A bind group description.
 //
@@ -388,7 +806,11 @@ pub fn compute_pipeline(label: Str, shader: GpuShaderId, entry: Str) -> GpuCompu
 // ```
 pub fn bind_group(label: Str, layout: GpuLayoutId,
                   bindings: [GpuBindingSlot]) -> GpuBindGroupDesc []
-    todo("gpu-nv.gpushader.bind_group")
+    GpuBindGroupDesc { label: label, layout: layout, bindings: bindings }
+
+// Is there a slot in this group for this binding number?
+fn slot_filled(slots: [GpuBindingSlot], binding: Int) -> Bool
+    list.any(slots, s => s.binding == binding)
 
 // Does a bind group fill every slot its layout declares?
 //
@@ -406,4 +828,8 @@ pub fn bind_group(label: Str, layout: GpuLayoutId,
 //     println("whether every slot is filled")
 // ```
 pub fn missing_bindings(d: GpuBindGroupDesc, l: GpuLayoutDesc) -> [Int] []
-    todo("gpu-nv.gpushader.missing_bindings")
+    var missing: [Int] = []
+    for b in l.bindings
+        if not slot_filled(d.bindings, b.binding)
+            missing = list.push(missing, b.binding)
+    missing

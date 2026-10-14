@@ -1,10 +1,6 @@
 // resource_tests.nv — the descriptors, and the two numbers that make a
 // readback silently wrong.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: gpu-nv.gpures.<fn>`.  That
-// is the expected result until the bodies land.
-//
 // WHERE THE CONSTANTS CAME FROM.  256 is WebGPU's
 // `COPY_BYTES_PER_ROW_ALIGNMENT` and is the same on Vulkan, Metal and
 // D3D12; 8192 and 4 are `maxTextureDimension2D` and `maxBindGroups` in
@@ -19,8 +15,8 @@ use gpures
 fn test_the_usage_sets_are_named_because_the_combinations_are_the_point() [io]
     test.case("nothing")
     let none_of_it = gpures.no_usage()
-    test.assert(none_of_it.storage == false)
-    test.assert(none_of_it.map_read == false)
+    test.assert(not none_of_it.storage)
+    test.assert(not none_of_it.map_read)
 
     test.case("a compute working buffer is copy-src, copy-dst and storage")
     let work = gpures.storage_usage()
@@ -29,13 +25,13 @@ fn test_the_usage_sets_are_named_because_the_combinations_are_the_point() [io]
     test.assert(work.copy_dst)
 
     test.case("and it is NOT mappable, which is why a readback needs a copy")
-    test.assert(work.map_read == false)
+    test.assert(not work.map_read)
 
     test.case("a readback buffer is copy-dst and mappable and not storage")
     let back = gpures.read_usage()
     test.assert(back.map_read)
     test.assert(back.copy_dst)
-    test.assert(back.storage == false)
+    test.assert(not back.storage)
 
 @test
 fn test_storage_and_map_read_together_are_refused_by_every_backend() [io]
@@ -53,7 +49,7 @@ fn test_storage_and_map_read_together_are_refused_by_every_backend() [io]
         index: false,
         map_read: true,
         map_write: false }
-    test.assert(gpures.usage_is_legal(both) == false)
+    test.assert(not gpures.usage_is_legal(both))
 
 @test
 fn test_a_row_stride_is_padded_to_the_alignment_or_the_image_shears() [io]
@@ -157,7 +153,7 @@ fn test_the_adapter_a_program_picks_is_not_the_first_one() [io]
 
     test.case("a software rasteriser is recognised")
     test.assert(gpures.is_software(software))
-    test.assert(gpures.is_software(discrete) == false)
+    test.assert(not gpures.is_software(discrete))
 
     test.case("and is not picked unless a caller asked for one")
     test.assert_none(gpures.preferred_adapter([software], false))
